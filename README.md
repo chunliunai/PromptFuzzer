@@ -332,7 +332,6 @@ npm run dev
 
 ```text
 PromptFuzzer/
-├── docs/                         # 架构、Workflow 与功能设计文档
 ├── src/main/java/com/promptfuzzer/
 │   ├── agent/workflow/           # Agent Workflow 引擎与节点
 │   ├── config/                   # 浏览器与异步执行配置
@@ -355,18 +354,6 @@ PromptFuzzer/
 - 只有显式设置 `targetConfig.login.required=true` 时才等待人工登录。
 - 登录状态保存在本地 `browser-auth/`，该目录已被 `.gitignore` 排除。
 - 并发 Agent 共享认证 Context，但每个 Agent 使用独立 Page。
-
-## 文档
-
-更多实现细节位于 [`docs/`](docs/)：
-
-- [项目结构介绍](docs/PromptFuzzer%20项目结构介绍.md)
-- [Workflow 架构与流程说明](docs/Workflow%20架构与流程说明.md)
-- [独立 RECON 任务与接口设计](docs/独立RECON任务与接口设计.txt)
-- [AI 构造 Payload 功能说明](docs/AI%20构造%20Payload%20功能说明.md)
-- [SSRF-OOB 自动化验证功能说明](docs/SSRF-OOB自动化验证功能说明.md)
-- [开发进度文档](docs/开发进度文档.md)
-- [待办事项](docs/待办事项.md)
 
 ## 当前状态
 
