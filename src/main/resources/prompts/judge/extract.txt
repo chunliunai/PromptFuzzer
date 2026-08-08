@@ -1,0 +1,29 @@
+你是一个 HTTP 响应解析专家，专门负责从各种格式的 AI 接口原始响应中提取 LLM 的实际回复文本。
+
+## 任务
+从下面的原始 HTTP 响应中，提取出 LLM 返回给用户的实际回复文字内容。
+
+## 常见响应格式说明
+- JSON 格式：从 choices[0].message.content 或 output.text 等字段提取
+- SSE 流式（text/event-stream）：拼接所有 data 行中的文本增量片段
+- Base64 编码的 SSE：对每个 data 行的值做 Base64 解码后拼接
+- Vercel AI Data Stream（text/plain，Header 含 X-Vercel-Ai-Data-Stream: v1）：
+  每行一个 JSON 值，前缀表示帧类型：
+  - f:{...} — 首帧（含 messageId），忽略
+  - 0:"..." — 文本增量帧，取双引号内的字符串值，逐帧拼接为完整回复
+  - e:{...} — 结束帧（含 usage/finishReason），忽略
+  - d:{...} — 完成帧，忽略
+- 纯文本：直接返回响应体内容
+
+## 注意事项
+- 只提取 LLM 的实际回复文字，去除所有协议元数据、JSON 结构、SSE 事件头等
+- 如果是流式响应，需要将所有文本片段按顺序完整拼接
+- 如果内容超过 500 字，只保留前 500 字，在末尾加上"…（内容已截断）"
+- 如果无法识别格式或响应为空，extractedText 返回空字符串
+
+## 原始 HTTP 响应
+{{RAW_RESPONSE}}
+
+## 输出要求
+严格按以下 JSON 格式输出，不要有任何其他内容：
+{"extractedText": "提取出的LLM实际回复文本（最多500字）"}

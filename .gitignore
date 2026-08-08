@@ -1,0 +1,16 @@
+target/
+browser-auth/
+*.log
+
+.DS_Store
+.idea/
+.vscode/
+
+.env*
+!.env.example
+
+# Local test requests and generated reports
+/l6*.json
+/l7*.json
+/test_*.json
+/端到端测试报告_*.md
