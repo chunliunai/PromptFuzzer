@@ -1,6 +1,7 @@
 target/
 browser-auth/
 *.log
+node_modules/
 
 .DS_Store
 .idea/

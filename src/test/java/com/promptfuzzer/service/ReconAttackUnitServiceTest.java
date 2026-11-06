@@ -10,6 +10,7 @@ import com.promptfuzzer.repository.ReconApplicationSurfaceRepository;
 import com.promptfuzzer.repository.ReconAttackUnitRepository;
 import com.promptfuzzer.repository.ReconResultRepository;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.Optional;
@@ -19,7 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ReconAttackUnitServiceTest {
@@ -39,6 +43,7 @@ class ReconAttackUnitServiceTest {
             surfaceRepository,
               mock(com.promptfuzzer.repository.ReconAttackCandidateRepository.class),
             promptService,
+            new GoalAwareAttackTemplateRegistry(),
             objectMapper);
 
     @Test
@@ -108,15 +113,21 @@ class ReconAttackUnitServiceTest {
         List<ReconAttackUnitResponse> responses =
                 service.generateAttackUnits(12L, request);
 
-        assertEquals(2, responses.size());
-        ReconAttackUnitResponse sandbox = responses.get(0);
-        assertEquals(List.of(81L, 82L), sandbox.getPrimarySurfaceIds());
-        assertEquals(List.of(83L), sandbox.getSupportingSurfaceIds());
-        assertEquals(List.of(86L), sandbox.getNegativeBoundarySurfaceIds());
-        assertEquals("HIGH", sandbox.getRiskLevel());
-        assertEquals("MEDIUM", sandbox.getConfidence());
+        assertEquals(4, responses.size());
+        ReconAttackUnitResponse command = responses.get(0);
+        assertEquals("COMMAND_EXECUTION", command.getUnitKey());
+        assertEquals(List.of(81L, 82L), command.getPrimarySurfaceIds());
+        assertEquals(List.of(83L), command.getSupportingSurfaceIds());
+        assertEquals(List.of(86L), command.getNegativeBoundarySurfaceIds());
+        assertEquals("HIGH", command.getRiskLevel());
+        assertEquals("MEDIUM", command.getConfidence());
 
-        ReconAttackUnitResponse file = responses.get(1);
+        assertEquals("SANDBOX_BOUNDARY_BYPASS",
+                responses.get(1).getUnitKey());
+        assertEquals("NETWORK_ACCESS_ABUSE",
+                responses.get(2).getUnitKey());
+
+        ReconAttackUnitResponse file = responses.get(3);
         assertEquals(List.of(84L), file.getPrimarySurfaceIds());
         assertEquals(List.of(), file.getSupportingSurfaceIds());
     }
@@ -136,7 +147,8 @@ class ReconAttackUnitServiceTest {
     }
 
     @Test
-    void rejectsAggregationWithoutValidPrimaryCapability() throws Exception {
+    void fallsBackToTemplatesWhenPromptHasNoValidPrimaryCapability()
+            throws Exception {
         when(resultRepository.findById(12L)).thenReturn(Optional.of(result()));
         when(surfaceRepository
                 .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
@@ -153,9 +165,175 @@ class ReconAttackUnitServiceTest {
                           }]
                         }
                         """));
+        stubSaveAll();
 
-        assertThrows(IllegalStateException.class,
-                () -> service.generateForBridge(12L, List.of(50L), 8));
+        List<ReconAttackUnit> units =
+                service.generateForBridge(12L, List.of(50L), 8);
+
+        assertEquals(3, units.size());
+        assertEquals("COMMAND_EXECUTION", units.get(0).getUnitKey());
+        assertEquals("SANDBOX_BOUNDARY_BYPASS", units.get(1).getUnitKey());
+        assertEquals("NETWORK_ACCESS_ABUSE", units.get(2).getUnitKey());
+    }
+
+    @Test
+    void splitsDifferentRenderAndExportSinksWithTemplates() throws Exception {
+        ReconApplicationSurface html = surface(
+                91L, "REPORT_RENDERING.HTML", "HTML报告生成",
+                "REPORT_RENDERING");
+        html.setSupportedActions("[\"generate\", \"render\"]");
+        ReconApplicationSurface csv = surface(
+                92L, "REPORT_RENDERING.CSV_EXPORT", "订单CSV导出",
+                "REPORT_RENDERING");
+        csv.setSupportedActions("[\"export\"]");
+        csv.setResourceScope("订单导出产物");
+
+        when(resultRepository.findById(12L)).thenReturn(Optional.of(result()));
+        when(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
+                .thenReturn(List.of(html, csv));
+        when(promptService.synthesizeAttackUnits(any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree("""
+                        {
+                          "attackUnits": [{
+                            "unitKey": "MIXED_REPORT_OUTPUT",
+                            "title": "报告渲染输出边界测试",
+                            "primarySurfaceIds": [91, 92],
+                            "supportingSurfaceIds": [],
+                            "negativeBoundarySurfaceIds": [],
+                            "riskDimensions": ["MIXED_OUTPUT"]
+                          }]
+                        }
+                        """));
+        stubSaveAll();
+
+        List<ReconAttackUnit> units =
+                service.generateForBridge(12L, null, 8);
+
+        assertEquals(2, units.size());
+        assertEquals("UNSAFE_RENDERING_OUTPUT", units.get(0).getUnitKey());
+        assertEquals("CSV_FORMULA_EXPORT", units.get(1).getUnitKey());
+    }
+
+    @Test
+    void keepsGlobalAttackUnitLimitAcrossTemplatesAndPrompt()
+            throws Exception {
+        when(resultRepository.findById(12L)).thenReturn(Optional.of(result()));
+        when(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
+                .thenReturn(surfaces());
+        when(promptService.synthesizeAttackUnits(any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree("""
+                        {
+                          "attackUnits": [{
+                            "unitKey": "FILE_INPUT",
+                            "title": "文件输入与解析边界",
+                            "primarySurfaceIds": [84],
+                            "supportingSurfaceIds": [],
+                            "negativeBoundarySurfaceIds": []
+                          }]
+                        }
+                        """));
+        stubSaveAll();
+
+        List<ReconAttackUnit> units =
+                service.generateForBridge(12L, List.of(50L), 1);
+
+        assertEquals(1, units.size());
+        assertEquals("COMMAND_EXECUTION", units.get(0).getUnitKey());
+    }
+
+    @Test
+    void keepsDefaultAttackUnitServerLimitAtEight() throws Exception {
+        when(resultRepository.findById(12L)).thenReturn(Optional.of(result()));
+        when(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
+                .thenReturn(surfaces());
+        when(promptService.synthesizeAttackUnits(any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"attackUnits\": []}"));
+        stubSaveAll();
+        CreateReconAttackUnitRequest request =
+                new CreateReconAttackUnitRequest();
+        request.setSurfaceIds(List.of(50L));
+        request.setMaxAttackUnits(24);
+
+        service.generateAttackUnits(12L, request);
+
+        verify(promptService).synthesizeAttackUnits(
+                any(), any(), eq(8));
+    }
+
+    @Test
+    void acceptsRaisedAttackUnitLimitAndClampsToServerLimit()
+            throws Exception {
+        ReflectionTestUtils.setField(service, "maxAttackUnits", 24);
+        when(resultRepository.findById(12L)).thenReturn(Optional.of(result()));
+        when(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
+                .thenReturn(surfaces());
+        when(promptService.synthesizeAttackUnits(any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"attackUnits\": []}"));
+        stubSaveAll();
+
+        service.generateForBridge(12L, List.of(50L), 24);
+        service.generateForBridge(12L, List.of(50L), 100);
+
+        verify(promptService, times(2)).synthesizeAttackUnits(
+                any(), any(), eq(24));
+    }
+
+    @Test
+    void derivesSecurityAttackUnitsFromFactsWithoutSelectableSurfaces()
+            throws Exception {
+        ReconResult result = result();
+        result.setCapabilityFacts("""
+                [
+                  {
+                    "capabilityKey": "TOOL_ECOSYSTEM.LIST.ALL",
+                    "domain": "TOOL_ECOSYSTEM",
+                    "evidenceLevel": "CLAIMED",
+                    "description": "目标枚举 get_account_info、read_doc、run_command 及参数结构"
+                  },
+                  {
+                    "capabilityKey": "SENSITIVE_INFO_EXPOSURE.CHECK.CONFIG",
+                    "domain": "SENSITIVE_INFO_EXPOSURE",
+                    "evidenceLevel": "CLAIMED",
+                    "description": "存在配置、环境变量、token 字段和调试输出通道"
+                  }
+                ]
+                """);
+        result.setToolInventory("""
+                [
+                  {"name": "read_doc", "parameters": ["filename"]},
+                  {"name": "run_command", "parameters": ["command"]}
+                ]
+                """);
+        when(resultRepository.findById(12L)).thenReturn(Optional.of(result));
+        when(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(12L))
+                .thenReturn(surfaces());
+        when(promptService.synthesizeAttackUnits(any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree("""
+                        {"attackUnits": []}
+                        """));
+        stubSaveAll();
+
+        List<ReconAttackUnit> units =
+                service.generateForBridge(12L, List.of(50L), 8);
+
+        List<String> keys = units.stream()
+                .map(ReconAttackUnit::getUnitKey)
+                .toList();
+        assertEquals(List.of(
+                "COMMAND_EXECUTION",
+                "SANDBOX_BOUNDARY_BYPASS",
+                "NETWORK_ACCESS_ABUSE",
+                "INTERNAL_TOOLING_DISCLOSURE",
+                "CREDENTIAL_DISCLOSURE"), keys);
+        assertEquals("[]", units.get(3).getPrimarySurfaceIds());
+        assertEquals("[]", units.get(4).getPrimarySurfaceIds());
     }
 
     @Test
@@ -261,5 +439,15 @@ class ReconAttackUnitServiceTest {
         result.setCurrentResult("{}");
         result.setCapabilityFacts("[]");
         return result;
+    }
+
+    private void stubSaveAll() {
+        when(attackUnitRepository.saveAll(any())).thenAnswer(invocation -> {
+            List<ReconAttackUnit> units = invocation.getArgument(0);
+            for (int i = 0; i < units.size(); i++) {
+                units.get(i).setId(20L + i);
+            }
+            return units;
+        });
     }
 }

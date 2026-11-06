@@ -11,10 +11,16 @@ import com.promptfuzzer.repository.ReconAttackUnitRepository;
 import com.promptfuzzer.repository.ReconResultRepository;
 import com.promptfuzzer.repository.ReconTaskRepository;
 import com.promptfuzzer.repository.ReconTraceRepository;
+import com.promptfuzzer.repository.ReplayProfileRepository;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Locale;
 
@@ -22,14 +28,35 @@ import java.util.Locale;
 @RequiredArgsConstructor
 public class ReconTaskService {
 
+    private static final int HARD_MAX_CAPABILITY_VERIFICATIONS = 64;
+
     private final ReconTaskRepository taskRepository;
     private final ReconResultRepository resultRepository;
     private final ReconTraceRepository traceRepository;
     private final ReconApplicationSurfaceRepository surfaceRepository;
     private final ReconAttackUnitRepository attackUnitRepository;
     private final ReconAttackCandidateRepository attackCandidateRepository;
+    private final ReplayProfileRepository replayProfileRepository;
     private final ReconExecutor reconExecutor;
     private final ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private BrowserTargetProfileService browserTargetProfileService;
+
+    @Value("${promptfuzzer.recon.limits.max-capability-verifications:8}")
+    private int maxCapabilityVerifications = 8;
+
+    @PostConstruct
+    void validateConfiguredLimits() {
+        if (maxCapabilityVerifications < 1
+                || maxCapabilityVerifications
+                > HARD_MAX_CAPABILITY_VERIFICATIONS) {
+            throw new IllegalStateException(
+                    "promptfuzzer.recon.limits.max-capability-verifications "
+                            + "must be between 1 and "
+                            + HARD_MAX_CAPABILITY_VERIFICATIONS);
+        }
+    }
 
     public ReconTaskResponse createTask(CreateReconTaskRequest request) {
         validateCreateRequest(request);
@@ -42,6 +69,7 @@ public class ReconTaskService {
         task.setRawRequestTemplate(request.getRawRequestTemplate());
         try {
             if (request.getTargetConfig() != null) {
+                persistBrowserTargetConfig(request.getTargetConfig(), request.getName());
                 task.setTargetConfig(objectMapper.writeValueAsString(request.getTargetConfig()));
             }
             CreateReconTaskRequest.ReconExecutionConfig config =
@@ -67,7 +95,16 @@ public class ReconTaskService {
             config.setMaxGapFollowups(
                     Math.max(0, Math.min(maxGapFollowups, 4)));
             config.setMaxCapabilityVerifications(
-                    Math.max(0, Math.min(maxVerifications, 8)));
+                    Math.max(0, Math.min(
+                            maxVerifications, maxCapabilityVerifications)));
+            config.setTargetExecutionMode(
+                    config.getTargetExecutionMode() != null
+                            ? config.getTargetExecutionMode()
+                            : ReconConfig.TargetExecutionMode.AUTO);
+            if (config.getTaskTimeoutSeconds() != null
+                    && config.getTaskTimeoutSeconds() <= 0) {
+                config.setTaskTimeoutSeconds(null);
+            }
             task.setReconConfig(objectMapper.writeValueAsString(config));
         } catch (Exception e) {
             throw new IllegalArgumentException("Invalid RECON configuration: " + e.getMessage(), e);
@@ -77,8 +114,21 @@ public class ReconTaskService {
         return ReconTaskResponse.from(task);
     }
 
+    private void persistBrowserTargetConfig(
+            com.promptfuzzer.config.BrowserTargetConfig config,
+            String displayName) {
+        if (browserTargetProfileService == null) {
+            return;
+        }
+        browserTargetProfileService.upsertFromConfig(config, displayName);
+        browserTargetProfileService.requireVerifiedForExecution(config);
+    }
+
     public List<ReconTaskResponse> listTasks() {
-        return taskRepository.findAll().stream()
+        return taskRepository.findAll(Sort.by(
+                        Sort.Order.desc("createdAt"),
+                        Sort.Order.desc("id")))
+                .stream()
                 .map(ReconTaskResponse::from)
                 .toList();
     }
@@ -87,12 +137,51 @@ public class ReconTaskService {
         return ReconTaskResponse.from(requireTask(taskId));
     }
 
+    public ReconTaskResponse cancelTask(Long taskId) {
+        ReconTask current = requireTask(taskId);
+        if (current.getStatus() != ReconTask.Status.PENDING
+                && current.getStatus() != ReconTask.Status.RUNNING) {
+            return ReconTaskResponse.from(current);
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        int updated = taskRepository.transitionStatus(
+                taskId,
+                List.of(ReconTask.Status.PENDING),
+                ReconTask.Status.CANCELLED,
+                null,
+                now,
+                now);
+        if (updated > 0) {
+            return ReconTaskResponse.from(requireTask(taskId));
+        }
+
+        updated = taskRepository.transitionStatus(
+                taskId,
+                List.of(ReconTask.Status.RUNNING),
+                ReconTask.Status.CANCEL_REQUESTED,
+                null,
+                null,
+                LocalDateTime.now());
+        if (updated > 0) {
+            return ReconTaskResponse.from(requireTask(taskId));
+        }
+
+        return ReconTaskResponse.from(requireTask(taskId));
+    }
+
     public ReconResultResponse getResultByTaskId(Long taskId) {
         requireTask(taskId);
         ReconResult result = resultRepository.findByReconTaskId(taskId)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "ReconResult not ready for task: " + taskId));
-        return ReconResultResponse.from(result);
+        ReconResultResponse response = ReconResultResponse.from(result);
+        response.setApplicationSurfaces(surfaceRepository
+                .findByReconResultIdAndDeletedFalseOrderByIdAsc(result.getId())
+                .stream()
+                .map(ReconApplicationSurfaceResponse::from)
+                .toList());
+        return response;
     }
 
     public List<ReconTraceResponse> getTraces(Long taskId) {
@@ -106,7 +195,8 @@ public class ReconTaskService {
     public void deleteTask(Long taskId) {
         ReconTask task = requireTask(taskId);
         if (task.getStatus() == ReconTask.Status.PENDING
-                || task.getStatus() == ReconTask.Status.RUNNING) {
+                || task.getStatus() == ReconTask.Status.RUNNING
+                || task.getStatus() == ReconTask.Status.CANCEL_REQUESTED) {
             throw new IllegalArgumentException(
                     "Running RECON task cannot be deleted: " + taskId);
         }
@@ -118,6 +208,7 @@ public class ReconTaskService {
             resultRepository.delete(result);
         });
         traceRepository.deleteByReconTaskId(taskId);
+        replayProfileRepository.deleteByTaskId(-Math.abs(taskId));
         taskRepository.delete(task);
     }
 
@@ -152,8 +243,19 @@ public class ReconTaskService {
                 == ReconApplicationSurface.SurfaceLevel.CAPABILITY);
         surface.setSurfaceType(request.getSurfaceType());
         surface.setRelatedTool(request.getRelatedTool());
-        surface.setSupportedActions(request.getSupportedActions());
+        surface.setSupportedActions(ReconSurfaceDataCodec.writeRequestStringArray(
+                request.getSupportedActions()));
         surface.setResourceScope(request.getResourceScope());
+        surface.setResourceObjects(ReconSurfaceDataCodec.writeRequestStringArray(
+                request.getResourceObjects()));
+        surface.setEntrypoints(ReconSurfaceDataCodec.writeRequestStringArray(
+                request.getEntrypoints()));
+        surface.setPermissionBoundaries(
+                ReconSurfaceDataCodec.writeRequestStringArray(
+                        request.getPermissionBoundaries()));
+        surface.setControlBoundaries(
+                ReconSurfaceDataCodec.writeRequestStringArray(
+                        request.getControlBoundaries()));
         surface.setEvidenceSource(ReconApplicationSurface.EvidenceSource.EXTERNAL_EVIDENCE);
         surface.setVerificationStatus(parseVerificationStatus(request.getVerificationStatus()));
         surface.setSourceType(ReconApplicationSurface.SourceType.USER_ADDED);
@@ -205,10 +307,32 @@ public class ReconTaskService {
             surface.setRelatedTool(request.getRelatedTool());
         }
         if (request.getSupportedActions() != null) {
-            surface.setSupportedActions(request.getSupportedActions());
+            surface.setSupportedActions(
+                    ReconSurfaceDataCodec.writeRequestStringArray(
+                            request.getSupportedActions()));
         }
         if (request.getResourceScope() != null) {
             surface.setResourceScope(request.getResourceScope());
+        }
+        if (request.getResourceObjects() != null) {
+            surface.setResourceObjects(
+                    ReconSurfaceDataCodec.writeRequestStringArray(
+                            request.getResourceObjects()));
+        }
+        if (request.getEntrypoints() != null) {
+            surface.setEntrypoints(
+                    ReconSurfaceDataCodec.writeRequestStringArray(
+                            request.getEntrypoints()));
+        }
+        if (request.getPermissionBoundaries() != null) {
+            surface.setPermissionBoundaries(
+                    ReconSurfaceDataCodec.writeRequestStringArray(
+                            request.getPermissionBoundaries()));
+        }
+        if (request.getControlBoundaries() != null) {
+            surface.setControlBoundaries(
+                    ReconSurfaceDataCodec.writeRequestStringArray(
+                            request.getControlBoundaries()));
         }
         if (request.getVerificationStatus() != null) {
             surface.setVerificationStatus(parseVerificationStatus(

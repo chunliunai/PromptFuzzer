@@ -4,6 +4,7 @@ import com.promptfuzzer.entity.ReconResult;
 import lombok.Data;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 @Data
 public class ReconResultResponse {
@@ -24,6 +25,7 @@ public class ReconResultResponse {
     private String unresolvedQuestions;
     private String surfaceQualityIssues;
     private String targetIntelligenceMemory;
+    private List<ReconApplicationSurfaceResponse> applicationSurfaces;
     private String qualityStatus;
     private Integer version;
     private LocalDateTime createdAt;

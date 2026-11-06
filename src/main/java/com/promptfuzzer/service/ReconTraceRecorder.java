@@ -23,9 +23,25 @@ public class ReconTraceRecorder {
                               String observation,
                               ReconTrace.EvidenceType evidenceType,
                               long startedAtMs) {
+        return success(reconTaskId, actionType, targetChatIndex, turnIndex,
+                requestMessage, rawResponse, extractedText, observation,
+                evidenceType, null, startedAtMs);
+    }
+
+    public ReconTrace success(Long reconTaskId,
+                              ReconTrace.ActionType actionType,
+                              Integer targetChatIndex,
+                              Integer turnIndex,
+                              String requestMessage,
+                              String rawResponse,
+                              String extractedText,
+                              String observation,
+                              ReconTrace.EvidenceType evidenceType,
+                              ReconTrace.ExecutionChannel executionChannel,
+                              long startedAtMs) {
         return record(reconTaskId, actionType, targetChatIndex, turnIndex, requestMessage,
                 rawResponse, extractedText, observation, evidenceType,
-                ReconTrace.Status.SUCCESS, null, startedAtMs);
+                executionChannel, ReconTrace.Status.SUCCESS, null, startedAtMs);
     }
 
     public ReconTrace error(Long reconTaskId,
@@ -35,8 +51,20 @@ public class ReconTraceRecorder {
                             String requestMessage,
                             Exception error,
                             long startedAtMs) {
+        return error(reconTaskId, actionType, targetChatIndex, turnIndex,
+                requestMessage, error, null, startedAtMs);
+    }
+
+    public ReconTrace error(Long reconTaskId,
+                            ReconTrace.ActionType actionType,
+                            Integer targetChatIndex,
+                            Integer turnIndex,
+                            String requestMessage,
+                            Exception error,
+                            ReconTrace.ExecutionChannel executionChannel,
+                            long startedAtMs) {
         return record(reconTaskId, actionType, targetChatIndex, turnIndex, requestMessage,
-                null, null, null, null, ReconTrace.Status.ERROR,
+                null, null, null, null, executionChannel, ReconTrace.Status.ERROR,
                 error != null ? error.getMessage() : "Unknown error", startedAtMs);
     }
 
@@ -49,6 +77,7 @@ public class ReconTraceRecorder {
                               String extractedText,
                               String observation,
                               ReconTrace.EvidenceType evidenceType,
+                              ReconTrace.ExecutionChannel executionChannel,
                               ReconTrace.Status status,
                               String errorMessage,
                               long startedAtMs) {
@@ -61,6 +90,7 @@ public class ReconTraceRecorder {
         trace.setRawResponse(rawResponse);
         trace.setExtractedText(extractedText);
         trace.setObservation(observation);
+        trace.setExecutionChannel(executionChannel);
         trace.setEvidenceType(evidenceType);
         trace.setStatus(status);
         trace.setErrorMessage(truncate(errorMessage, ERROR_MAX_CHARS));

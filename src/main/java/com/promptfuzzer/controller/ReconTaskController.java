@@ -1,6 +1,7 @@
 package com.promptfuzzer.controller;
 
 import com.promptfuzzer.dto.*;
+import com.promptfuzzer.service.ReplayProfileService;
 import com.promptfuzzer.service.ReconTaskService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -13,6 +14,7 @@ import java.util.List;
 public class ReconTaskController {
 
     private final ReconTaskService reconTaskService;
+    private final ReplayProfileService replayProfileService;
 
     @PostMapping("/api/recon-tasks")
     public ResponseEntity<ReconTaskResponse> createTask(
@@ -30,6 +32,12 @@ public class ReconTaskController {
         return ResponseEntity.ok(reconTaskService.getTask(taskId));
     }
 
+    @PostMapping("/api/recon-tasks/{taskId}/cancel")
+    public ResponseEntity<ReconTaskResponse> cancelTask(
+            @PathVariable Long taskId) {
+        return ResponseEntity.ok(reconTaskService.cancelTask(taskId));
+    }
+
     @GetMapping("/api/recon-tasks/{taskId}/result")
     public ResponseEntity<ReconResultResponse> getResult(@PathVariable Long taskId) {
         return ResponseEntity.ok(reconTaskService.getResultByTaskId(taskId));
@@ -40,6 +48,13 @@ public class ReconTaskController {
         return ResponseEntity.ok(reconTaskService.getTraces(taskId));
     }
 
+    @GetMapping("/api/recon-tasks/{taskId}/replay-profiles")
+    public ResponseEntity<List<ReplayProfileResponse>> getReplayProfiles(@PathVariable Long taskId) {
+        Long routingTaskId = -Math.abs(taskId);
+        return ResponseEntity.ok(replayProfileService.listByTaskId(routingTaskId).stream()
+                .map(ReplayProfileResponse::from)
+                .toList());
+    }
 
     @DeleteMapping("/api/recon-tasks/{taskId}")
     public ResponseEntity<Void> deleteTask(@PathVariable Long taskId) {

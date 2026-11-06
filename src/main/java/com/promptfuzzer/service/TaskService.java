@@ -1,6 +1,7 @@
 package com.promptfuzzer.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.promptfuzzer.config.BrowserTargetConfig;
 import com.promptfuzzer.dto.CreateTaskRequest;
 import com.promptfuzzer.dto.PageResponse;
 import com.promptfuzzer.dto.ScanResultResponse;
@@ -16,6 +17,7 @@ import com.promptfuzzer.repository.AgentStrategySnapshotRepository;
 import com.promptfuzzer.repository.AgentWorkflowTraceRepository;
 import com.promptfuzzer.repository.OobTargetRepository;
 import com.promptfuzzer.repository.ReconAttackCandidateRepository;
+import com.promptfuzzer.repository.ReplayProfileRepository;
 import com.promptfuzzer.repository.ScanPayloadRepository;
 import com.promptfuzzer.repository.ScanResultRepository;
 import com.promptfuzzer.repository.TaskRepository;
@@ -23,6 +25,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -45,13 +49,19 @@ public class TaskService {
     private final AgentWorkflowTraceRepository agentWorkflowTraceRepository;
     private final AgentStrategySnapshotRepository agentStrategySnapshotRepository;
     private final ReconAttackCandidateRepository reconAttackCandidateRepository;
+    private final ReplayProfileRepository replayProfileRepository;
     private final ScanExecutorService scanExecutorService;
     private final AgentSessionExecutor agentSessionExecutor;
     private final AutoModeService autoModeService;
+    private final BrowserSingleTurnService browserSingleTurnService;
+    private final BrowserService browserService;
     private final PayloadGeneratorService payloadGeneratorService;
     private final OobService oobService;
     private final ReconIntelligenceService reconIntelligenceService;
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Autowired(required = false)
+    private BrowserTargetProfileService browserTargetProfileService;
 
     public TaskResponse createTask(CreateTaskRequest request) {
         Task task = new Task();
@@ -73,9 +83,11 @@ public class TaskService {
         // BROWSER mode: serialize targetConfig JSON to Task
         if (task.getScanMode() == Task.ScanMode.BROWSER && request.getTargetConfig() != null) {
             try {
+                persistBrowserTargetConfig(request.getTargetConfig(), request.getName());
                 task.setTargetConfig(objectMapper.writeValueAsString(request.getTargetConfig()));
             } catch (Exception e) {
                 log.error("Failed to serialize targetConfig", e);
+                throw new IllegalArgumentException("Invalid browser targetConfig: " + e.getMessage(), e);
             }
         }
 
@@ -113,9 +125,11 @@ public class TaskService {
             // === AGENT MODE: create agent sessions ===
             List<AgentSession> sessions = buildAgentSessions(task, request, reconMemory);
             agentSessionRepository.saveAll(sessions);
+            agentSessionRepository.flush();
             task.setTotalCount(sessions.size());
             task.setStatus(Task.TaskStatus.RUNNING);
             taskRepository.save(task);
+            taskRepository.flush();
 
             // Launch each agent async
             for (AgentSession session : sessions) {
@@ -131,6 +145,32 @@ public class TaskService {
             throw new IllegalArgumentException(
                     "SINGLE_TURN requires non-empty goalIds and techniqueIds");
         }
+        if (task.getScanMode() == Task.ScanMode.BROWSER) {
+            BrowserTargetConfig browserConfig = parseBrowserConfig(task);
+            Long browserSessionId = taskId;
+            task.setStatus(Task.TaskStatus.RUNNING);
+            taskRepository.save(task);
+            try {
+                browserService.openSession(browserSessionId, browserConfig);
+                browserSingleTurnService.runScoutPhase(
+                        taskId, task, browserSessionId, browserConfig,
+                        task.getAttackContext(), request.getGoalIds(), request.getTechniqueIds());
+                Task refreshed = taskRepository.findById(taskId).orElse(task);
+                refreshed.setStatus(Task.TaskStatus.COMPLETED);
+                taskRepository.save(refreshed);
+                try { browserService.closeSession(browserSessionId); } catch (Exception ignored) {}
+                oobService.finalizeTaskOobResult(taskId);
+                return TaskResponse.from(refreshed);
+            } catch (Exception e) {
+                log.error("Browser SINGLE_TURN task {} failed", taskId, e);
+                Task failed = taskRepository.findById(taskId).orElse(task);
+                failed.setStatus(Task.TaskStatus.FAILED);
+                taskRepository.save(failed);
+                try { browserService.closeSession(browserSessionId); } catch (Exception ignored) {}
+                oobService.finalizeTaskOobResult(taskId);
+                return TaskResponse.from(failed);
+            }
+        }
         List<ScanPayload> payloads = buildPayloadsWithAI(task, request);
         scanPayloadRepository.saveAll(payloads);
 
@@ -140,6 +180,14 @@ public class TaskService {
         scanExecutorService.executeTask(taskId);
 
         return TaskResponse.from(task);
+    }
+
+    private void persistBrowserTargetConfig(BrowserTargetConfig config, String displayName) {
+        if (browserTargetProfileService == null) {
+            return;
+        }
+        browserTargetProfileService.upsertFromConfig(config, displayName);
+        browserTargetProfileService.requireVerifiedForExecution(config);
     }
 
     private List<AgentSession> buildAgentSessions(Task task, CreateTaskRequest request,
@@ -266,6 +314,14 @@ public class TaskService {
         return payloads;
     }
 
+    private BrowserTargetConfig parseBrowserConfig(Task task) {
+        try {
+            return objectMapper.readValue(task.getTargetConfig(), BrowserTargetConfig.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse browser config for task " + task.getId(), e);
+        }
+    }
+
     private String buildAttackContextWithOob(String attackContext, OobTarget target) {
         if (target == null) {
             return attackContext;
@@ -279,7 +335,10 @@ public class TaskService {
     }
 
     public List<TaskResponse> listTasks() {
-        return taskRepository.findAll().stream()
+        return taskRepository.findAll(Sort.by(
+                        Sort.Order.desc("createdAt"),
+                        Sort.Order.desc("id")))
+                .stream()
                 .map(TaskResponse::from)
                 .collect(Collectors.toList());
     }
@@ -342,6 +401,7 @@ public class TaskService {
 
         agentWorkflowTraceRepository.deleteByTaskId(id);
         agentStrategySnapshotRepository.deleteByTaskId(id);
+        replayProfileRepository.deleteByTaskId(id);
         agentSessionRepository.deleteByTaskId(id);
         scanResultRepository.deleteByTaskId(id);
         scanPayloadRepository.deleteByTaskId(id);

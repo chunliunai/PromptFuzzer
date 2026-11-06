@@ -22,5 +22,8 @@ public class CreateReconTaskRequest {
         private Integer maxGapFollowups = 3;
         private Integer maxCapabilityVerifications = 6;
         private Boolean cleanBetweenVerifications = true;
+        private ReconConfig.TargetExecutionMode targetExecutionMode =
+                ReconConfig.TargetExecutionMode.AUTO;
+        private Integer taskTimeoutSeconds;
     }
 }

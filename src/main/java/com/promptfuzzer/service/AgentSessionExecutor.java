@@ -294,6 +294,8 @@ class AgentWorkflowSessionRunnerImpl implements AgentWorkflowSessionRunner {
                 turnsInPhase++;
                 currentTurn = turnNum;
                 session.setCurrentTurn(turnNum);
+                session.setCurrentPhase(currentPhase);
+                agentSessionRepository.save(session);
                 AgentTurnBudget turnBudget = AgentTurnBudget.forExecutingTurn(turnNum, maxTurns);
 
                 Map<String, Object> turnRecord = new LinkedHashMap<>();

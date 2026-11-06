@@ -58,6 +58,12 @@ public class ReconTask {
     }
 
     public enum Status {
-        PENDING, RUNNING, COMPLETED, FAILED
+        PENDING,
+        RUNNING,
+        CANCEL_REQUESTED,
+        CANCELLED,
+        TIMED_OUT,
+        COMPLETED,
+        FAILED
     }
 }

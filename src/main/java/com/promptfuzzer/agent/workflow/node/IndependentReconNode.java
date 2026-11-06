@@ -12,6 +12,7 @@ import com.promptfuzzer.dto.ReconConfig;
 import com.promptfuzzer.service.AgentPlannerService;
 import com.promptfuzzer.service.AgentWorkflowTraceRecorder;
 import com.promptfuzzer.service.JudgeService;
+import com.promptfuzzer.service.TargetExecutionRouter;
 import lombok.Builder;
 import lombok.RequiredArgsConstructor;
 import lombok.Value;
@@ -215,8 +216,15 @@ public class IndependentReconNode implements AgentWorkflowNode {
                     .build();
             String response;
             if (context.isBrowserMode()) {
-                response = executeTargetNode.sendBrowserMessage(
+                TargetExecutionRouter.TargetExecutionResult executionResult = executeTargetNode.sendBrowserMessageAuto(
                         context, turnState, browserSessionId, message);
+                response = executionResult.getExtractedText() != null
+                        && !executionResult.getExtractedText().isBlank()
+                        ? executionResult.getExtractedText()
+                        : executionResult.getRawResponse();
+                turn.put("executionChannel", executionResult.getExecutionChannel());
+                turn.put("replayProfileId", executionResult.getReplayProfileId());
+                turn.put("replayProfileClassification", executionResult.getReplayProfileClassification());
             } else {
                 String rawResponse = executeTargetNode.sendHttp(
                         context, turnState, context.getTask().getRawRequestTemplate(), message);

@@ -1,5 +1,6 @@
 package com.promptfuzzer.dto;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import lombok.Data;
 
 @Data
@@ -13,7 +14,11 @@ public class UpdateReconApplicationSurfaceRequest {
     private String description;
     private String surfaceType;
     private String relatedTool;
-    private String supportedActions;
+    private JsonNode supportedActions;
     private String resourceScope;
+    private JsonNode resourceObjects;
+    private JsonNode entrypoints;
+    private JsonNode permissionBoundaries;
+    private JsonNode controlBoundaries;
     private String verificationStatus;
 }

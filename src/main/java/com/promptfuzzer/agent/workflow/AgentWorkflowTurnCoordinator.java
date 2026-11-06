@@ -2,11 +2,14 @@ package com.promptfuzzer.agent.workflow;
 
 import com.promptfuzzer.agent.workflow.node.AnalyzeNode;
 import com.promptfuzzer.agent.workflow.node.ExecuteTargetNode;
+import com.promptfuzzer.agent.workflow.node.ExtractTargetResponseNode;
 import com.promptfuzzer.agent.workflow.node.GeneratePayloadNode;
 import com.promptfuzzer.agent.workflow.node.JudgeOrExtractNode;
 import com.promptfuzzer.agent.workflow.node.MemoryDeltaNode;
 import com.promptfuzzer.service.AgentPlannerService;
 import com.promptfuzzer.service.JudgeService;
+import com.promptfuzzer.service.TargetResponseNormalizerService;
+import com.promptfuzzer.service.TargetExecutionRouter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
@@ -20,6 +23,7 @@ public class AgentWorkflowTurnCoordinator {
     private final AnalyzeNode analyzeNode;
     private final GeneratePayloadNode generatePayloadNode;
     private final ExecuteTargetNode executeTargetNode;
+    private final ExtractTargetResponseNode extractTargetResponseNode;
     private final JudgeOrExtractNode judgeOrExtractNode;
     private final MemoryDeltaNode memoryDeltaNode;
 
@@ -121,10 +125,16 @@ public class AgentWorkflowTurnCoordinator {
                     throw new IllegalStateException("生成器返回空消息");
                 }
                 turnRecord.put("message", message);
-                String rawResponse = executeTargetNode.sendBrowserMessage(
+                TargetExecutionRouter.TargetExecutionResult executionResult = executeTargetNode.sendBrowserMessageAuto(
                         request.getContext(), state, request.getBrowserSessionId(), message);
+                String rawResponse = executionResult.getRawResponse();
+                turnRecord.put("executionChannel", executionResult.getExecutionChannel());
+                turnRecord.put("replayProfileId", executionResult.getReplayProfileId());
+                turnRecord.put("replayProfileClassification", executionResult.getReplayProfileClassification());
                 turnRecord.put("extractedText", rawResponse);
-                applyJudgeResult(request.getContext(), state, rawResponse, turnRecord, true);
+                applyJudgeResult(request.getContext(), state, rawResponse, turnRecord,
+                        executionResult.getExecutionChannel(),
+                        !"BROWSER".equals(executionResult.getExecutionChannel()));
                 yield new DispatchResult(rawResponse, targetChatIndex);
             }
             case "NEW_CHAT" -> {
@@ -171,21 +181,39 @@ public class AgentWorkflowTurnCoordinator {
                                   String rawResponse,
                                   Map<String, Object> turnRecord,
                                   boolean browserMode) {
-        AgentWorkflowState responseState = state.toBuilder().rawResponse(rawResponse).build();
+        applyJudgeResult(context, state, rawResponse, turnRecord,
+                browserMode ? "BROWSER" : "HTTP_TEMPLATE", !browserMode);
+    }
+
+    private void applyJudgeResult(AgentWorkflowContext context,
+                                  AgentWorkflowState state,
+                                  String rawResponse,
+                                  Map<String, Object> turnRecord,
+                                  String executionChannel,
+                                  boolean allowAiFallback) {
+        TargetResponseNormalizerService.NormalizedTargetResponse normalized =
+                extractTargetResponseNode.execute(context, state, rawResponse, null, executionChannel, allowAiFallback);
+        turnRecord.put("rawResponse", normalized.rawResponse());
+        turnRecord.put("rawResponseChars", normalized.rawResponseChars());
+        turnRecord.put("extractedText", normalized.extractedText());
+        turnRecord.put("executionChannel", normalized.executionChannel());
+        turnRecord.put("responseProtocol", normalized.responseProtocol());
+        turnRecord.put("extractionMethod", normalized.extractionMethod());
+        turnRecord.put("extractionConfidence", normalized.extractionConfidence());
+
+        AgentWorkflowState responseState = state.toBuilder()
+                .rawResponse(normalized.rawResponse())
+                .extractedText(normalized.extractedText())
+                .build();
         if ("ATTACK".equals(state.getPhase())) {
             JudgeService.JudgeResult judgeResult = judgeOrExtractNode.execute(context, responseState, "judge");
             turnRecord.put("extractedText", judgeResult.getExtractedText());
             turnRecord.put("verdict", judgeResult.getVerdict());
             turnRecord.put("evidence", judgeResult.getEvidence());
-        } else if (browserMode) {
-            judgeOrExtractNode.recordBrowserExtract(context, responseState);
-            turnRecord.put("extractedText", rawResponse);
+        } else if ("BROWSER".equals(executionChannel)) {
             turnRecord.put("verdict", null);
             turnRecord.put("evidence", null);
         } else {
-            JudgeService.JudgeResult extractResult =
-                    judgeOrExtractNode.execute(context, responseState, "extractOnly");
-            turnRecord.put("extractedText", extractResult.getExtractedText());
             turnRecord.put("verdict", null);
             turnRecord.put("evidence", null);
         }

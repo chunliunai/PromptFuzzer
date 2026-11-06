@@ -127,19 +127,34 @@ public class AutoModeService {
             }
         }
         agentSessionRepository.saveAll(sessions);
+        agentSessionRepository.flush();
         refreshed.setTotalCount(refreshed.getTotalCount() + sessions.size());
         refreshed.setStatus(Task.TaskStatus.RUNNING);
         taskRepository.save(refreshed);
+        taskRepository.flush();
 
         // Each browser Agent gets an isolated page. They share only the authenticated
         // browser context, preventing concurrent messages from stealing each other's DOM response.
         if (isBrowser && browserSessionId != null && browserConfig != null) {
-            for (AgentSession session : sessions) {
-                browserService.forkSession(
-                        browserSessionId, session.getId(), browserConfig);
-                agentSessionExecutor.executeSession(session.getId());
+            List<Long> forkedSessionIds = new ArrayList<>();
+            try {
+                for (AgentSession session : sessions) {
+                    browserService.forkSession(
+                            browserSessionId, session.getId(), browserConfig);
+                    forkedSessionIds.add(session.getId());
+                }
+                browserService.closeSession(browserSessionId);
+                browserSessionId = null;
+                for (AgentSession session : sessions) {
+                    agentSessionExecutor.executeSession(session.getId());
+                }
+            } catch (Exception e) {
+                for (Long forkedSessionId : forkedSessionIds) {
+                    try { browserService.closeSession(forkedSessionId); } catch (Exception ignored) {}
+                }
+                try { browserService.closeSession(browserSessionId); } catch (Exception ignored) {}
+                throw e;
             }
-            browserService.closeSession(browserSessionId);
         } else {
             for (AgentSession session : sessions) {
                 agentSessionExecutor.executeSession(session.getId());

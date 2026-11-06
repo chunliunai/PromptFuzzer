@@ -36,7 +36,10 @@ public class JudgeService {
     private static final Set<String> SUPPORTED_GOALS = Set.of(
             "prompt_leak", "credential_leak", "user_data_leak",
             "context_leak", "model_info", "prohibited_content", "fake_confirmation",
-            "protected_value_extraction", "command_execution", "authorization_bypass"
+            "protected_value_extraction", "command_execution", "authorization_bypass",
+            "query_injection", "unsafe_rendering_output", "rag_knowledge_leak",
+            "internal_tooling_disclosure", "unauthorized_business_read",
+            "unauthorized_business_mutation", "unauthorized_tool_access"
     );
     private static final int EXTRACT_MAX_CHARS = 6000;
     private static final int JUDGE_MAX_CHARS = 3000;
@@ -55,6 +58,13 @@ public class JudgeService {
         loadPrompt("judge_protected_value_extraction", "prompts/judge/judge_protected_value_extraction.txt");
         loadPrompt("judge_command_execution", "prompts/judge/judge_command_execution.txt");
         loadPrompt("judge_authorization_bypass", "prompts/judge/judge_authorization_bypass.txt");
+        loadPrompt("judge_query_injection", "prompts/judge/judge_query_injection.txt");
+        loadPrompt("judge_unsafe_rendering_output", "prompts/judge/judge_unsafe_rendering_output.txt");
+        loadPrompt("judge_rag_knowledge_leak", "prompts/judge/judge_rag_knowledge_leak.txt");
+        loadPrompt("judge_internal_tooling_disclosure", "prompts/judge/judge_internal_tooling_disclosure.txt");
+        loadPrompt("judge_unauthorized_business_read", "prompts/judge/judge_unauthorized_business_read.txt");
+        loadPrompt("judge_unauthorized_business_mutation", "prompts/judge/judge_unauthorized_business_mutation.txt");
+        loadPrompt("judge_unauthorized_tool_access", "prompts/judge/judge_unauthorized_tool_access.txt");
     }
 
     private void loadPrompt(String key, String path) {
@@ -86,11 +96,17 @@ public class JudgeService {
     }
 
     public JudgeResult judge(String rawResponse, String goal, String attackContext) {
-        JudgeResult fallback = new JudgeResult();
-        fallback.setVerdict("UNCERTAIN");
-        fallback.setEvidence("AI 判分未配置或调用失败");
-        fallback.setExtractedText("");
-        fallback.setRawResponse("");
+        try {
+            String extractedText = extractLlmReply(rawResponse);
+            return judgeExtractedText(extractedText, goal, attackContext);
+        } catch (Exception e) {
+            log.error("Judge failed for goal={}", goal, e);
+            return fallback("AI 判分未配置或调用失败", "");
+        }
+    }
+
+    public JudgeResult judgeExtractedText(String extractedText, String goal, String attackContext) {
+        JudgeResult fallback = fallback("AI 判分未配置或调用失败", extractedText);
 
         if (apiKey == null || apiKey.equals("sk-placeholder")) {
             log.warn("DashScope API key not configured, skipping judge");
@@ -102,15 +118,12 @@ public class JudgeService {
             return fallback;
         }
 
+        if (extractedText == null || extractedText.isBlank()) {
+            fallback.setEvidence("无法从响应中提取 LLM 回复文本");
+            return fallback;
+        }
+
         try {
-            String extractedText = extractLlmReply(rawResponse);
-            fallback.setExtractedText(extractedText);
-
-            if (extractedText == null || extractedText.isBlank()) {
-                fallback.setEvidence("无法从响应中提取 LLM 回复文本");
-                return fallback;
-            }
-
             JudgeResult result = judgeByGoal(extractedText, goal, attackContext);
             result.setExtractedText(extractedText);
             result.setExtractedTextLength(extractedText.length());
@@ -118,11 +131,19 @@ public class JudgeService {
                     ? extractedText
                     : extractedText.substring(0, PREVIEW_MAX_CHARS) + "…");
             return result;
-
         } catch (Exception e) {
             log.error("Judge failed for goal={}", goal, e);
             return fallback;
         }
+    }
+
+    private JudgeResult fallback(String evidence, String extractedText) {
+        JudgeResult fallback = new JudgeResult();
+        fallback.setVerdict("UNCERTAIN");
+        fallback.setEvidence(evidence);
+        fallback.setExtractedText(extractedText != null ? extractedText : "");
+        fallback.setRawResponse("");
+        return fallback;
     }
 
     private String extractLlmReply(String rawResponse) throws Exception {

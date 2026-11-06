@@ -31,12 +31,15 @@ public class JudgeOrExtractNode implements AgentWorkflowNode {
         Map<String, Object> input = mapOf(
                 "mode", mode,
                 "goal", state.getGoal(),
-                "rawResponseChars", length(state.getRawResponse())
+                "rawResponseChars", length(state.getRawResponse()),
+                "extractedTextChars", length(state.getExtractedText())
         );
         try {
             JudgeService.JudgeResult result;
             if ("judge".equals(mode)) {
-                result = judgeService.judge(state.getRawResponse(), state.getGoal(), state.getAttackContext());
+                result = state.getExtractedText() != null && !state.getExtractedText().isBlank()
+                        ? judgeService.judgeExtractedText(state.getExtractedText(), state.getGoal(), state.getAttackContext())
+                        : judgeService.judge(state.getRawResponse(), state.getGoal(), state.getAttackContext());
                 traceRecorder.success(context.getTask(), context.getSession(), name(), state.getPhase(),
                         state.getRetryIndex(), state.getTurnIndex(), state.getTargetChatIndex(),
                         input,

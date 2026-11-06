@@ -9,19 +9,24 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Scanner;
 
 @Service
 @RequiredArgsConstructor
 public class ReconPromptService {
+
+    private static final int CONNECT_TIMEOUT_MS = 15000;
+    private static final int READ_TIMEOUT_MS = 45000;
+    private static final int POST_PROCESS_READ_TIMEOUT_MS = 90000;
 
     @Value("${promptfuzzer.dashscope.api-key}")
     private String apiKey;
@@ -155,7 +160,7 @@ public class ReconPromptService {
                         truncate(value(coverageMatrix, "[]"), 16000))
                 .replace("{{TRACE_RECORDS}}",
                         truncate(value(traceRecordsJson, "[]"), 32000));
-        return callForJson(prompt, 0.1);
+        return callForJson(prompt, 0.1, POST_PROCESS_READ_TIMEOUT_MS);
     }
 
     public JsonNode synthesizeApplicationSurfaces(
@@ -166,10 +171,14 @@ public class ReconPromptService {
                         truncate(value(json(evidenceSummary), "{}"), 32000))
                 .replace("{{COVERAGE_MATRIX}}",
                         truncate(value(coverageMatrix, "[]"), 16000));
-        return callForJson(prompt, 0.1);
+        return callForJson(prompt, 0.1, POST_PROCESS_READ_TIMEOUT_MS);
     }
 
     private JsonNode callForJson(String prompt, double temperature) throws Exception {
+        return callForJson(prompt, temperature, READ_TIMEOUT_MS);
+    }
+
+    private JsonNode callForJson(String prompt, double temperature, int readTimeoutMs) throws Exception {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("DASHSCOPE_API_KEY is not configured");
         }
@@ -189,32 +198,25 @@ public class ReconPromptService {
         body.put("input", input);
         body.put("parameters", parameters);
 
-        HttpURLConnection connection = (HttpURLConnection) new URL(
-                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation")
-                .openConnection();
-        connection.setRequestMethod("POST");
-        connection.setRequestProperty("Authorization", "Bearer " + apiKey);
-        connection.setRequestProperty("Content-Type", "application/json");
-        connection.setDoOutput(true);
-        connection.setConnectTimeout(15000);
-        connection.setReadTimeout(120000);
-
-        try (OutputStream output = connection.getOutputStream()) {
-            output.write(objectMapper.writeValueAsBytes(body));
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(CONNECT_TIMEOUT_MS))
+                .build();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"))
+                .timeout(Duration.ofMillis(readTimeoutMs))
+                .header("Authorization", "Bearer " + apiKey)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        objectMapper.writeValueAsString(body), StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() >= 400) {
+            throw new IllegalStateException(
+                    "DashScope HTTP " + response.statusCode() + ": " + response.body());
         }
 
-        int status = connection.getResponseCode();
-        InputStream responseStream = status >= 400
-                ? connection.getErrorStream() : connection.getInputStream();
-        String response;
-        try (Scanner scanner = new Scanner(responseStream, StandardCharsets.UTF_8)) {
-            response = scanner.useDelimiter("\\A").hasNext() ? scanner.next() : "";
-        }
-        if (status >= 400) {
-            throw new IllegalStateException("DashScope HTTP " + status + ": " + response);
-        }
-
-        String text = objectMapper.readTree(response).path("output").path("text").asText("");
+        String text = objectMapper.readTree(response.body()).path("output").path("text").asText("");
         return objectMapper.readTree(extractJson(text));
     }
 

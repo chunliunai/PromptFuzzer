@@ -13,11 +13,14 @@ import com.promptfuzzer.repository.ReconAttackCandidateRepository;
 import com.promptfuzzer.repository.ReconResultRepository;
 import com.promptfuzzer.repository.ReconTaskRepository;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
@@ -90,7 +93,8 @@ class ReconAttackCandidateServiceTest {
         assertEquals(1, responses.size());
         ReconAttackCandidateResponse response = responses.get(0);
         assertEquals(12L, response.getAttackUnitId());
-        assertEquals("authorization_bypass", response.getRecommendedGoal());
+        assertEquals("unauthorized_business_read",
+                response.getRecommendedGoal());
         assertEquals("DUAL", response.getRecommendedAttackMode());
         assertEquals(List.of(38L, 39L), response.getSurfaceIds());
         assertEquals("DUAL", response.getRequestBody().path("attackMode").asText());
@@ -100,6 +104,21 @@ class ReconAttackCandidateServiceTest {
         assertEquals(39L, response.getRequestBody()
                 .path("selectedSurfaceIds").get(1).asLong());
         assertEquals("BROWSER", response.getRequestBody().path("scanMode").asText());
+        assertEquals(true, response.getAttackContext()
+                .contains("目标具备【业务数据访问与权限边界】相关功能/能力"));
+        assertEquals(true, response.getAttackContext()
+                .contains("当前任务主要验证【业务对象越权读取测试】"));
+        assertFalse(response.getAttackContext().contains("成功标准"));
+        assertFalse(response.getAttackContext().contains("失败标准"));
+        assertEquals("tool_intent", response.getRequestBody()
+                .path("techniqueIds").get(0).asText());
+        assertEquals("role_play", response.getRequestBody()
+                .path("techniqueIds").get(1).asText());
+        assertEquals("rule_fabrication", response.getRequestBody()
+                .path("techniqueIds").get(2).asText());
+        assertEquals(5, response.getRequestBody().path("maxTurns").asInt());
+        assertEquals(0, response.getRequestBody().path("retryCount").asInt());
+        assertEquals(1, response.getRequestBody().path("generateCount").asInt());
     }
 
     @Test
@@ -130,9 +149,171 @@ class ReconAttackCandidateServiceTest {
 
         assertEquals(1, responses.size());
         assertEquals(12L, responses.get(0).getAttackUnitId());
-        assertEquals("authorization_bypass",
+        assertEquals("unauthorized_business_read",
                 responses.get(0).getRecommendedGoal());
         assertEquals(List.of(38L, 39L), responses.get(0).getSurfaceIds());
+    }
+
+    @Test
+    void mapsNewRiskPatternsToDedicatedGoals() throws Exception {
+        ReconAttackUnit queryUnit = attackUnit(
+                21L,
+                "QUERY_INJECTION",
+                "交易记录查询查询注入",
+                "交易记录查询",
+                "[\"QUERY_INJECTION\"]",
+                "[\"AUTHORIZATION\"]");
+        ReconAttackUnit renderUnit = attackUnit(
+                22L,
+                "UNSAFE_RENDERING_OUTPUT",
+                "HTML 不安全渲染输出",
+                "HTML 报告生成",
+                "[\"UNSAFE_RENDERING_OUTPUT\"]",
+                "[\"OUTPUT_RENDERING\"]");
+        ReconAttackUnit ragUnit = attackUnit(
+                23L,
+                "RAG_KNOWLEDGE_LEAK",
+                "企业知识库检索边界",
+                "企业知识库",
+                "[\"RAG_KNOWLEDGE_LEAK\"]",
+                "[\"KNOWLEDGE_BASE_ACCESS_CONTROL\"]");
+        ReconAttackUnit internalToolingUnit = attackUnit(
+                24L,
+                "INTERNAL_TOOLING_DISCLOSURE",
+                "内部工具信息泄露",
+                "工具注册表",
+                "[\"INTERNAL_TOOLING_DISCLOSURE\"]",
+                "[\"TOOL_METADATA_BOUNDARY\"]");
+        ReconAttackUnit readUnit = attackUnit(
+                25L,
+                "UNAUTHORIZED_BUSINESS_READ",
+                "业务越权读取",
+                "业务对象",
+                "[\"UNAUTHORIZED_BUSINESS_READ\"]",
+                "[\"AUTHORIZATION\"]");
+        ReconAttackUnit mutationUnit = attackUnit(
+                26L,
+                "UNAUTHORIZED_BUSINESS_MUTATION",
+                "业务越权操作",
+                "业务操作",
+                "[\"UNAUTHORIZED_BUSINESS_MUTATION\"]",
+                "[\"AUTHORIZATION\"]");
+        ReconAttackUnit toolUnit = attackUnit(
+                27L,
+                "UNAUTHORIZED_TOOL_ACCESS",
+                "越权工具调用",
+                "受限工具",
+                "[\"UNAUTHORIZED_TOOL_ACCESS\"]",
+                "[\"TOOL_AUTHORIZATION\"]");
+        when(resultRepository.findById(9L)).thenReturn(Optional.of(result()));
+        when(reconTaskRepository.findById(11L))
+                .thenReturn(Optional.of(browserReconTask()));
+        when(attackUnitService.resolveForCandidateGeneration(
+                9L, null, null, 8)).thenReturn(List.of(
+                        queryUnit, renderUnit, ragUnit, internalToolingUnit,
+                        readUnit, mutationUnit, toolUnit));
+        when(promptService.generateCandidates(
+                any(), any(), any(), any(), anyInt()))
+                .thenReturn(objectMapper.readTree("""
+                        {
+                          "candidates": [
+                            {
+                              "attackUnitId": 21,
+                              "title": "查询注入",
+                              "recommendedGoal": "authorization_bypass",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 22,
+                              "title": "渲染输出",
+                              "recommendedGoal": "context_leak",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 23,
+                              "title": "知识库检索",
+                              "recommendedGoal": "user_data_leak",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 24,
+                              "title": "内部工具",
+                              "recommendedGoal": "model_info",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 25,
+                              "title": "业务读取",
+                              "recommendedGoal": "authorization_bypass",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 26,
+                              "title": "业务操作",
+                              "recommendedGoal": "authorization_bypass",
+                              "attackContext": "old"
+                            },
+                            {
+                              "attackUnitId": 27,
+                              "title": "工具调用",
+                              "recommendedGoal": "authorization_bypass",
+                              "attackContext": "old"
+                            }
+                          ]
+                        }
+                        """));
+        when(candidateRepository.saveAll(any())).thenAnswer(invocation ->
+                invocation.getArgument(0));
+
+        List<ReconAttackCandidateResponse> responses =
+                service.generateCandidates(
+                        9L, new CreateReconAttackCandidateRequest());
+
+        assertEquals(7, responses.size());
+        assertEquals("query_injection",
+                responses.get(0).getRecommendedGoal());
+        assertEquals("unsafe_rendering_output",
+                responses.get(1).getRecommendedGoal());
+        assertEquals("rag_knowledge_leak",
+                responses.get(2).getRecommendedGoal());
+        assertEquals("internal_tooling_disclosure",
+                responses.get(3).getRecommendedGoal());
+        assertEquals("unauthorized_business_read",
+                responses.get(4).getRecommendedGoal());
+        assertEquals("unauthorized_business_mutation",
+                responses.get(5).getRecommendedGoal());
+        assertEquals("unauthorized_tool_access",
+                responses.get(6).getRecommendedGoal());
+        assertEquals("query_injection", responses.get(0).getRequestBody()
+                .path("goalIds").get(0).asText());
+        assertEquals("unsafe_rendering_output", responses.get(1).getRequestBody()
+                .path("goalIds").get(0).asText());
+        assertEquals("rag_knowledge_leak", responses.get(2).getRequestBody()
+                .path("goalIds").get(0).asText());
+        assertEquals("internal_tooling_disclosure",
+                responses.get(3).getRequestBody()
+                        .path("goalIds").get(0).asText());
+        assertEquals("unauthorized_business_read",
+                responses.get(4).getRequestBody()
+                        .path("goalIds").get(0).asText());
+        assertEquals("unauthorized_business_mutation",
+                responses.get(5).getRequestBody()
+                        .path("goalIds").get(0).asText());
+        assertEquals("unauthorized_tool_access",
+                responses.get(6).getRequestBody()
+                        .path("goalIds").get(0).asText());
+        assertEquals(true, responses.get(1).getAttackContext()
+                .contains("不安全渲染输出测试"));
+        assertEquals(true, responses.get(2).getAttackContext()
+                .contains("RAG 知识库检索边界测试"));
+        assertEquals(true, responses.get(3).getAttackContext()
+                .contains("内部工具信息泄露测试"));
+        assertEquals(true, responses.get(4).getAttackContext()
+                .contains("业务越权读取测试"));
+        assertEquals(true, responses.get(5).getAttackContext()
+                .contains("业务越权变更测试"));
+        assertEquals(true, responses.get(6).getAttackContext()
+                .contains("越权工具调用测试"));
     }
 
     @Test
@@ -172,6 +353,15 @@ class ReconAttackCandidateServiceTest {
                 candidate.getStatus());
         assertEquals(95L, candidate.getTaskId());
         verify(taskService).createTask(any());
+    }
+
+    @Test
+    void executeCandidateDoesNotWrapLongRunningTaskCreationInTransaction()
+            throws Exception {
+        Method method = ReconAttackCandidateService.class.getMethod(
+                "executeCandidate", Long.class);
+
+        assertFalse(method.isAnnotationPresent(Transactional.class));
     }
 
     @Test
@@ -224,17 +414,33 @@ class ReconAttackCandidateServiceTest {
     }
 
     private ReconAttackUnit attackUnit() {
+        return attackUnit(
+                12L,
+                "BUSINESS_DATA_ACCESS",
+                "业务数据访问与权限边界",
+                "业务数据访问与权限边界",
+                "[\"IDOR\"]",
+                "[\"AUTHORIZATION\"]");
+    }
+
+    private ReconAttackUnit attackUnit(
+            Long id,
+            String unitKey,
+            String title,
+            String resourceBoundary,
+            String riskDimensions,
+            String securityControls) {
         ReconAttackUnit unit = new ReconAttackUnit();
-        unit.setId(12L);
+        unit.setId(id);
         unit.setReconResultId(9L);
-        unit.setUnitKey("BUSINESS_DATA_ACCESS");
-        unit.setTitle("业务数据访问与权限边界");
+        unit.setUnitKey(unitKey);
+        unit.setTitle(title);
         unit.setDescription("测试经营数据访问边界");
         unit.setPrimarySurfaceIds("[38]");
         unit.setSupportingSurfaceIds("[39]");
         unit.setNegativeBoundarySurfaceIds("[]");
-        unit.setSecurityControls("[\"AUTHORIZATION\"]");
-        unit.setRiskDimensions("[\"IDOR\"]");
+        unit.setSecurityControls(securityControls);
+        unit.setRiskDimensions(riskDimensions);
         unit.setRiskLevel(ReconAttackUnit.RiskLevel.HIGH);
         unit.setConfidence(ReconAttackUnit.ConfidenceLevel.MEDIUM);
         unit.setSourceSurfaceSnapshot("[]");

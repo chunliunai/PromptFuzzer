@@ -8,6 +8,7 @@ public final class AgentWorkflowNodes {
     public static final String ANALYZE = "ANALYZE";
     public static final String GENERATE_PAYLOAD = "GENERATE_PAYLOAD";
     public static final String EXECUTE_TARGET = "EXECUTE_TARGET";
+    public static final String EXTRACT_TARGET_RESPONSE = "EXTRACT_TARGET_RESPONSE";
     public static final String STRATEGY_CHECK = "STRATEGY_CHECK";
     public static final String REPLAN = "REPLAN";
     public static final String COMPOSITE_REVIEW = "COMPOSITE_REVIEW";

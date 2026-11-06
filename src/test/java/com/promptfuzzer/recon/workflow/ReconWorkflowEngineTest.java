@@ -16,6 +16,7 @@ import com.promptfuzzer.service.JudgeService;
 import com.promptfuzzer.service.ReconPromptService;
 import com.promptfuzzer.service.ReconSurfaceQualityService;
 import com.promptfuzzer.service.ReconTraceRecorder;
+import com.promptfuzzer.service.TargetExecutionRouter;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -77,6 +79,18 @@ class ReconWorkflowEngineTest {
                 anyString(), anyString());
         verify(fixtures.promptService).synthesizeApplicationSurfaces(
                 any(), anyString());
+        verify(fixtures.traceRecorder, atLeastOnce()).success(
+                eq(12L),
+                eq(ReconTrace.ActionType.CAPABILITY_DISCOVERY),
+                anyInt(),
+                anyInt(),
+                anyString(),
+                anyString(),
+                anyString(),
+                anyString(),
+                eq(ReconTrace.EvidenceType.AGENT_CLAIM),
+                eq(ReconTrace.ExecutionChannel.BROWSER),
+                anyLong());
 
         ArgumentCaptor<ReconApplicationSurface> surfaceCaptor =
                 ArgumentCaptor.forClass(ReconApplicationSurface.class);
@@ -91,6 +105,12 @@ class ReconWorkflowEngineTest {
         assertEquals(201L, saved.get(1).getParentSurfaceId());
         assertEquals(ReconApplicationSurface.VerificationStatus.VERIFIED,
                 saved.get(1).getVerificationStatus());
+        assertEquals("[\"command\"]", saved.get(1).getResourceObjects());
+        assertEquals("[\"chat\"]", saved.get(1).getEntrypoints());
+        assertEquals("[\"workspace\"]",
+                saved.get(1).getPermissionBoundaries());
+        assertEquals("[\"sandbox\"]", saved.get(1).getControlBoundaries());
+        assertEquals("[5]", saved.get(1).getSourceTraceIds());
     }
 
     @Test
@@ -125,7 +145,8 @@ class ReconWorkflowEngineTest {
                 eq(0),
                 eq(2),
                 eq("Ask all"),
-                any(IllegalStateException.class),
+                any(RuntimeException.class),
+                eq(ReconTrace.ExecutionChannel.BROWSER),
                 anyLong());
         verify(fixtures.promptService).planCoverage(
                 eq("survey capabilities"),
@@ -167,7 +188,8 @@ class ReconWorkflowEngineTest {
                 eq(0),
                 eq(4),
                 eq("Ask business"),
-                any(IllegalStateException.class),
+                any(RuntimeException.class),
+                eq(ReconTrace.ExecutionChannel.BROWSER),
                 anyLong());
         verify(fixtures.promptService).analyzeCoverageGaps(
                 eq("survey capabilities"),
@@ -175,6 +197,54 @@ class ReconWorkflowEngineTest {
                 contains("support Bash"),
                 eq(3));
         verify(fixtures.browserService).closeSession(-12L);
+    }
+
+    @Test
+    void summaryReceivesCompactTraceRecordsInsteadOfFullResponses()
+            throws Exception {
+        Fixtures fixtures = fixtures();
+        ReconTask task = browserTask();
+        when(fixtures.taskRepository.findById(12L))
+                .thenReturn(Optional.of(task));
+        when(fixtures.browserService.readPage(-12L, null))
+                .thenReturn("Agent page");
+        stubPromptFlow(fixtures.promptService);
+        when(fixtures.browserService.sendMessage(-12L, "Ask all"))
+                .thenReturn("I support business, files, Bash and tools.");
+        when(fixtures.browserService.sendMessage(-12L, "Ask business"))
+                .thenReturn("I query orders with order_mcp.");
+        when(fixtures.browserService.sendMessage(-12L, "Ask code"))
+                .thenReturn("I support Bash in a sandbox.");
+        when(fixtures.browserService.sendMessage(-12L, "Ask files"))
+                .thenReturn("I can export CSV files.");
+        when(fixtures.browserService.newChat(-12L)).thenReturn(true);
+        when(fixtures.browserService.sendMessage(-12L, "Run harmless Bash"))
+                .thenReturn("recon-ok");
+        stubPersistence(fixtures, 104L);
+        ReconTrace longTrace = new ReconTrace();
+        longTrace.setId(66L);
+        longTrace.setActionType(ReconTrace.ActionType.CAPABILITY_VERIFY);
+        longTrace.setTargetChatIndex(2);
+        longTrace.setTurnIndex(9);
+        longTrace.setRequestMessage("Render an HTML card");
+        longTrace.setExtractedText("<div>" + "very-long-html".repeat(200) + "</div>");
+        longTrace.setObservation("executionChannel=HTTP_REPLAY, statusCode=200");
+        longTrace.setEvidenceType(ReconTrace.EvidenceType.AGENT_CLAIM);
+        longTrace.setStatus(ReconTrace.Status.SUCCESS);
+        when(fixtures.traceRepository.findByReconTaskIdOrderByIdAsc(12L))
+                .thenReturn(List.of(longTrace));
+
+        fixtures.engine.execute(12L);
+
+        ArgumentCaptor<String> traceJsonCaptor = ArgumentCaptor.forClass(String.class);
+        verify(fixtures.promptService).summarizeEvidence(
+                eq("survey capabilities"), isNull(), eq("Agent page"),
+                anyString(), traceJsonCaptor.capture());
+        String traceJson = traceJsonCaptor.getValue();
+        assertTrue(traceJson.contains("\"traceId\":66"));
+        assertTrue(traceJson.contains("包含 HTML 片段"));
+        assertTrue(traceJson.contains("已截断"));
+        assertFalse(traceJson.contains("very-long-html".repeat(100)));
     }
 
     @Test
@@ -212,6 +282,94 @@ class ReconWorkflowEngineTest {
                 eq(ReconTrace.ActionType.SURFACE_QUALITY_GATE),
                 eq(0), anyInt(), isNull(), anyString(), anyString(),
                 anyString(), eq(ReconTrace.EvidenceType.OBSERVED), anyLong());
+    }
+
+    @Test
+    void cancellationCannotBeOverwrittenByCompletion() throws Exception {
+        Fixtures fixtures = fixtures();
+        ReconTask task = browserTask();
+        when(fixtures.taskRepository.findById(12L))
+                .thenReturn(Optional.of(task));
+        when(fixtures.browserService.readPage(-12L, null))
+                .thenReturn("Agent page");
+        stubPromptFlow(fixtures.promptService);
+        when(fixtures.targetExecutionRouter.send(
+                any(), any(), any(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    task.setStatus(ReconTask.Status.CANCEL_REQUESTED);
+                    TargetExecutionRouter.TargetExecutionResult result =
+                            new TargetExecutionRouter.TargetExecutionResult();
+                    result.setRawResponse("cancel after this call");
+                    result.setExtractedText("cancel after this call");
+                    result.setExecutionChannel("BROWSER");
+                    return result;
+                });
+
+        fixtures.engine.execute(12L);
+
+        assertEquals(ReconTask.Status.CANCELLED, task.getStatus());
+        verify(fixtures.browserService).closeSession(-12L);
+        verify(fixtures.promptService, never()).summarizeEvidence(
+                any(), any(), any(), anyString(), anyString());
+    }
+
+    @Test
+    void taskTimeoutEndsWorkflowAndClosesBrowser() {
+        Fixtures fixtures = fixtures();
+        ReconTask task = browserTask();
+        task.setReconConfig("""
+                {
+                  "maxDiscoveryMessages": 4,
+                  "maxGapFollowups": 3,
+                  "maxCapabilityVerifications": 6,
+                  "cleanBetweenVerifications": true,
+                  "taskTimeoutSeconds": 1
+                }
+                """);
+        when(fixtures.taskRepository.findById(12L))
+                .thenReturn(Optional.of(task));
+        when(fixtures.browserService.readPage(-12L, null))
+                .thenAnswer(invocation -> {
+                    Thread.sleep(1050);
+                    return "Agent page";
+                });
+
+        fixtures.engine.execute(12L);
+
+        assertEquals(ReconTask.Status.TIMED_OUT, task.getStatus());
+        verify(fixtures.browserService).closeSession(-12L);
+        verifyNoInteractions(fixtures.promptService);
+    }
+
+    @Test
+    void workflowFailureClosesBrowserAndRemainsFailed()
+            throws Exception {
+        Fixtures fixtures = fixtures();
+        ReconTask task = browserTask();
+        when(fixtures.taskRepository.findById(12L))
+                .thenReturn(Optional.of(task));
+        when(fixtures.browserService.readPage(-12L, null))
+                .thenReturn("Agent page");
+        stubPromptFlow(fixtures.promptService);
+        when(fixtures.promptService.planCoverage(
+                any(), any(), any(), any(), anyInt()))
+                .thenThrow(new IllegalStateException("plan failed"));
+        when(fixtures.targetExecutionRouter.send(
+                any(), any(), any(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    TargetExecutionRouter.TargetExecutionResult result =
+                            new TargetExecutionRouter.TargetExecutionResult();
+                    result.setRawResponse("capabilities");
+                    result.setExtractedText("capabilities");
+                    result.setExecutionChannel("BROWSER");
+                    return result;
+                });
+
+        fixtures.engine.execute(12L);
+
+        assertEquals(ReconTask.Status.FAILED, task.getStatus());
+        assertEquals("plan failed", task.getErrorMessage());
+        verify(fixtures.browserService).closeSession(-12L);
     }
 
     private void stubPromptFlow(ReconPromptService promptService)
@@ -301,6 +459,10 @@ class ReconWorkflowEngineTest {
                       "description": "已完成无害验证",
                       "surfaceType": "CODE_EXECUTION",
                       "supportedActions": ["execute"],
+                      "resourceObjects": ["command"],
+                      "entrypoints": ["chat"],
+                      "permissionBoundaries": ["workspace"],
+                      "controlBoundaries": ["sandbox"],
                       "sourceTraceIds": [5],
                       "capabilityKeys": [
                         "CODE_EXECUTION.EXECUTE.BASH_COMMAND"
@@ -352,6 +514,30 @@ class ReconWorkflowEngineTest {
 
     private Fixtures fixtures() {
         ReconTaskRepository taskRepository = mock(ReconTaskRepository.class);
+        when(taskRepository.transitionStatus(
+                anyLong(), anyCollection(), any(), any(), any(), any()))
+                .thenAnswer(invocation -> {
+                    Long taskId = invocation.getArgument(0);
+                    @SuppressWarnings("unchecked")
+                    List<ReconTask.Status> expectedStatuses =
+                            (List<ReconTask.Status>) invocation.getArgument(1);
+                    ReconTask.Status newStatus = invocation.getArgument(2);
+                    String errorMessage = invocation.getArgument(3);
+                    java.time.LocalDateTime completedAt =
+                            invocation.getArgument(4);
+                    Optional<ReconTask> current =
+                            taskRepository.findById(taskId);
+                    if (current.isEmpty()
+                            || !expectedStatuses.contains(
+                            current.get().getStatus())) {
+                        return 0;
+                    }
+                    ReconTask task = current.get();
+                    task.setStatus(newStatus);
+                    task.setErrorMessage(errorMessage);
+                    task.setCompletedAt(completedAt);
+                    return 1;
+                });
         ReconResultRepository resultRepository =
                 mock(ReconResultRepository.class);
         ReconTraceRepository traceRepository =
@@ -361,6 +547,20 @@ class ReconWorkflowEngineTest {
         ReconTraceRecorder traceRecorder = mock(ReconTraceRecorder.class);
         ReconPromptService promptService = mock(ReconPromptService.class);
         BrowserService browserService = mock(BrowserService.class);
+        TargetExecutionRouter targetExecutionRouter = mock(TargetExecutionRouter.class);
+        when(targetExecutionRouter.send(
+                any(), any(), any(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    Long browserSessionId = invocation.getArgument(2);
+                    String message = invocation.getArgument(3);
+                    String response = browserService.sendMessage(browserSessionId, message);
+                    TargetExecutionRouter.TargetExecutionResult result =
+                            new TargetExecutionRouter.TargetExecutionResult();
+                    result.setRawResponse(response);
+                    result.setExtractedText(response);
+                    result.setExecutionChannel("BROWSER");
+                    return result;
+                });
         HttpRequestService httpRequestService = mock(HttpRequestService.class);
         JudgeService judgeService = mock(JudgeService.class);
         ReconSurfaceQualityService qualityService =
@@ -374,6 +574,7 @@ class ReconWorkflowEngineTest {
                 promptService,
                 qualityService,
                 browserService,
+                targetExecutionRouter,
                 httpRequestService,
                 judgeService,
                 objectMapper);
@@ -385,6 +586,7 @@ class ReconWorkflowEngineTest {
                 traceRecorder,
                 promptService,
                 browserService,
+                targetExecutionRouter,
                 httpRequestService,
                 judgeService,
                 engine);
@@ -440,6 +642,7 @@ class ReconWorkflowEngineTest {
             ReconTraceRecorder traceRecorder,
             ReconPromptService promptService,
             BrowserService browserService,
+            TargetExecutionRouter targetExecutionRouter,
             HttpRequestService httpRequestService,
             JudgeService judgeService,
             ReconWorkflowEngine engine) {

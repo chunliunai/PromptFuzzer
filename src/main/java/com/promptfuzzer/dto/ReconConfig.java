@@ -10,6 +10,11 @@ import lombok.Data;
 @Data
 public class ReconConfig {
 
+    public enum TargetExecutionMode {
+        AUTO,
+        BROWSER_ONLY
+    }
+
     private Boolean enabled = true;
 
     /**

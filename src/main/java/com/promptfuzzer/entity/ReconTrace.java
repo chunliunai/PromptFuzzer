@@ -38,6 +38,10 @@ public class ReconTrace {
     private String observation;
 
     @Enumerated(EnumType.STRING)
+    @Column(columnDefinition = "VARCHAR(32)")
+    private ExecutionChannel executionChannel;
+
+    @Enumerated(EnumType.STRING)
     @Column(columnDefinition = "VARCHAR(64)")
     private EvidenceType evidenceType;
 
@@ -74,6 +78,12 @@ public class ReconTrace {
         RESULT_OBSERVED,
         OBSERVED,
         EXTERNAL_EVIDENCE
+    }
+
+    public enum ExecutionChannel {
+        BROWSER,
+        HTTP_REPLAY,
+        HTTP_TEMPLATE
     }
 
     public enum Status {

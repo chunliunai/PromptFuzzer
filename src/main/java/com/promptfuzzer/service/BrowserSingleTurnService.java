@@ -1,5 +1,7 @@
 package com.promptfuzzer.service;
 
+import com.promptfuzzer.agent.workflow.AgentWorkflowContext;
+import com.promptfuzzer.agent.workflow.AgentWorkflowState;
 import com.promptfuzzer.config.BrowserTargetConfig;
 import com.promptfuzzer.entity.ScanPayload;
 import com.promptfuzzer.entity.ScanResult;
@@ -13,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Browser-mode single-turn executor for AUTO Phase 1.
@@ -27,6 +30,7 @@ public class BrowserSingleTurnService {
 
     private final PayloadGeneratorService payloadGenerator;
     private final BrowserService browserService;
+    private final TargetExecutionRouter targetExecutionRouter;
     private final JudgeService judgeService;
     private final ScanPayloadRepository payloadRepo;
     private final ScanResultRepository resultRepo;
@@ -46,6 +50,11 @@ public class BrowserSingleTurnService {
         int successCount = 0;
         int failCount = 0;
         int uncertainCount = 0;
+        int targetChatIndex = -1;
+        AgentWorkflowContext context = AgentWorkflowContext.builder()
+                .task(task)
+                .browserMode(true)
+                .build();
 
         for (String goalId : goalIds) {
             for (String techniqueId : techniqueIds) {
@@ -62,9 +71,14 @@ public class BrowserSingleTurnService {
 
                     // NEW_CHAT at START: ensure clean slate regardless of previous outcome
                     try {
-                        browserService.newChat(browserSessionId);
+                        if (browserService.newChat(browserSessionId)) {
+                            targetChatIndex++;
+                        }
                     } catch (Exception ex) {
                         log.warn("NEW_CHAT failed for scout: {}", ex.getMessage());
+                    }
+                    if (targetChatIndex < 0) {
+                        targetChatIndex = 0;
                     }
 
                     // Persist payload
@@ -79,21 +93,38 @@ public class BrowserSingleTurnService {
                     payloadRepo.save(payload);
                     totalSent++;
 
-                    // Send via browser
-                    String rawResponse;
+                    // Send through the same routing layer used by Agent so Scout can
+                    // capture HTTP replay metadata and browser fallback evidence.
+                    ScoutExecution execution;
                     try {
-                        rawResponse = browserService.sendMessage(browserSessionId, message);
-                        if (rawResponse == null || rawResponse.isBlank()) {
+                        long startedAt = System.currentTimeMillis();
+                        AgentWorkflowState state = AgentWorkflowState.builder()
+                                .taskId(taskId)
+                                .phase("SCOUT")
+                                .turnIndex(totalSent)
+                                .retryIndex(0)
+                                .targetChatIndex(targetChatIndex)
+                                .message(message)
+                                .build();
+                        TargetExecutionRouter.TargetExecutionResult executionResult =
+                                targetExecutionRouter.send(context, state, browserSessionId, message);
+                        execution = ScoutExecution.from(executionResult,
+                                (int) (System.currentTimeMillis() - startedAt),
+                                targetChatIndex);
+                        if (execution.responseForJudge().isBlank()
+                                || isDefaultGreeting(execution.responseForJudge())) {
                             log.warn("Scout payload {} empty response, skipping", payload.getId());
                             markPayloadResult(payload, task, ScanResult.Verdict.UNCERTAIN,
-                                    null, "浏览器返回空响应");
+                                    null, "目标未返回有效新响应",
+                                    null, execution);
                             uncertainCount++;
                             continue;
                         }
                     } catch (Exception e) {
                         log.error("Scout payload {} send failed: {}", payload.getId(), e.getMessage());
                         markPayloadResult(payload, task, ScanResult.Verdict.UNCERTAIN,
-                                null, "浏览器发送异常: " + e.getMessage());
+                                null, "浏览器发送异常: " + e.getMessage(),
+                                null, ScoutExecution.error(message));
                         uncertainCount++;
                         continue;
                     }
@@ -101,12 +132,14 @@ public class BrowserSingleTurnService {
                     // Judge
                     try {
                         JudgeService.JudgeResult judgeResult = judgeService.judge(
-                                rawResponse, goalId, attackContext);
+                                execution.responseForJudge(), goalId, attackContext);
                         ScanResult.Verdict verdict = ScanResult.Verdict.valueOf(judgeResult.getVerdict());
                         markPayloadResult(payload, task,
                                 verdict,
                                 judgeResult.getExtractedText(),
-                                judgeResult.getEvidence());
+                                judgeResult.getEvidence(),
+                                judgeResult.getRawResponse(),
+                                execution);
 
                         log.info("Scout: goal={} tech={} verdict={}",
                                 goalId, techniqueId, judgeResult.getVerdict());
@@ -126,7 +159,8 @@ public class BrowserSingleTurnService {
                     } catch (Exception e) {
                         log.error("Scout payload {} judge failed: {}", payload.getId(), e.getMessage());
                         markPayloadResult(payload, task, ScanResult.Verdict.UNCERTAIN,
-                                null, "Judge异常: " + e.getMessage());
+                                null, "Judge异常: " + e.getMessage(),
+                                null, execution);
                         uncertainCount++;
                     }
 
@@ -149,8 +183,9 @@ public class BrowserSingleTurnService {
     }
 
     private void markPayloadResult(ScanPayload payload, Task task,
-                                    ScanResult.Verdict verdict, String extractedText, String evidence) {
-        payload.setStatus(ScanPayload.PayloadStatus.SENT);
+                                   ScanResult.Verdict verdict, String extractedText, String evidence,
+                                   String rawJudgeResponse, ScoutExecution execution) {
+        payload.setStatus(ScanPayload.PayloadStatus.JUDGED);
         payloadRepo.save(payload);
 
         ScanResult result = new ScanResult();
@@ -160,7 +195,79 @@ public class BrowserSingleTurnService {
         result.setHarmType(payload.getGoal());
         result.setExtractedText(extractedText);
         result.setEvidence(evidence);
-        result.setResponseTime(0);
+        result.setRawJudgeResponse(rawJudgeResponse);
+        if (execution != null) {
+            result.setRequestBody(execution.requestBody());
+            result.setResponseBody(execution.rawResponse());
+            result.setResponseTime(execution.responseTimeMs());
+            result.setExecutionChannel(execution.executionChannel());
+            result.setReplayProfileId(execution.replayProfileId());
+            result.setReplayProfileClassification(execution.replayProfileClassification());
+            result.setStatusCode(execution.statusCode());
+            result.setContentType(execution.contentType());
+            result.setTargetChatIndex(execution.targetChatIndex());
+        }
         resultRepo.save(result);
+    }
+
+    private boolean isDefaultGreeting(String text) {
+        if (text == null) {
+            return false;
+        }
+        String normalized = text.replaceAll("\\s+", "")
+                .replaceAll("[。！？?!,.，、:：;；'\"“”‘’]", "")
+                .toLowerCase(Locale.ROOT);
+        return normalized.equals("今天我能为你做些什么")
+                || normalized.equals("今天我能为您做些什么")
+                || normalized.equals("我能为你做些什么")
+                || normalized.equals("我能为您做些什么")
+                || normalized.equals("有什么可以帮你")
+                || normalized.equals("有什么可以帮您")
+                || normalized.contains("howcanihelpyoutoday")
+                || normalized.contains("whatcanidoforyoutoday");
+    }
+
+    private record ScoutExecution(
+            String requestBody,
+            String rawResponse,
+            String extractedText,
+            String executionChannel,
+            Long replayProfileId,
+            String replayProfileClassification,
+            Integer statusCode,
+            String contentType,
+            Integer responseTimeMs,
+            Integer targetChatIndex) {
+
+        static ScoutExecution from(TargetExecutionRouter.TargetExecutionResult result,
+                                   int responseTimeMs,
+                                   int targetChatIndex) {
+            if (result == null) {
+                return error(null);
+            }
+            return new ScoutExecution(
+                    result.getRequestBody(),
+                    result.getRawResponse(),
+                    result.getExtractedText(),
+                    result.getExecutionChannel(),
+                    result.getReplayProfileId(),
+                    result.getReplayProfileClassification(),
+                    result.getStatusCode(),
+                    result.getContentType(),
+                    Math.max(0, responseTimeMs),
+                    targetChatIndex);
+        }
+
+        static ScoutExecution error(String requestBody) {
+            return new ScoutExecution(requestBody, null, null, "ERROR",
+                    null, null, null, null, 0, null);
+        }
+
+        String responseForJudge() {
+            if (extractedText != null && !extractedText.isBlank()) {
+                return extractedText;
+            }
+            return rawResponse != null ? rawResponse : "";
+        }
     }
 }

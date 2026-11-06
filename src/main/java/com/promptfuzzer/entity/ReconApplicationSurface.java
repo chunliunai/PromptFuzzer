@@ -50,6 +50,18 @@ public class ReconApplicationSurface {
     @Column(columnDefinition = "TEXT")
     private String resourceScope;
 
+    @Column(columnDefinition = "TEXT")
+    private String resourceObjects;
+
+    @Column(columnDefinition = "TEXT")
+    private String entrypoints;
+
+    @Column(columnDefinition = "TEXT")
+    private String permissionBoundaries;
+
+    @Column(columnDefinition = "TEXT")
+    private String controlBoundaries;
+
     @Enumerated(EnumType.STRING)
     private EvidenceSource evidenceSource = EvidenceSource.AGENT_CLAIM;
 

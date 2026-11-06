@@ -20,6 +20,16 @@ public class ScanResultResponse {
     private String extractedTextPreview;
     private Integer extractedTextLength;
     private Integer responseTime;
+    private String requestBodyPreview;
+    private Integer requestBodyLength;
+    private String responseBodyPreview;
+    private Integer responseBodyLength;
+    private String executionChannel;
+    private Long replayProfileId;
+    private String replayProfileClassification;
+    private Integer statusCode;
+    private String contentType;
+    private Integer targetChatIndex;
 
     public static ScanResultResponse from(ScanResult result, com.promptfuzzer.entity.ScanPayload payload) {
         ScanResultResponse r = new ScanResultResponse();
@@ -30,12 +40,24 @@ public class ScanResultResponse {
         r.setHarmType(result.getHarmType());
         r.setEvidence(result.getEvidence());
         r.setResponseTime(result.getResponseTime());
+        r.setExecutionChannel(result.getExecutionChannel());
+        r.setReplayProfileId(result.getReplayProfileId());
+        r.setReplayProfileClassification(result.getReplayProfileClassification());
+        r.setStatusCode(result.getStatusCode());
+        r.setContentType(result.getContentType());
+        r.setTargetChatIndex(result.getTargetChatIndex());
         String extracted = result.getExtractedText();
         if (extracted != null) {
             r.setExtractedTextLength(extracted.length());
-            r.setExtractedTextPreview(extracted.length() <= 500
-                    ? extracted
-                    : extracted.substring(0, 500) + "…");
+            r.setExtractedTextPreview(preview(extracted));
+        }
+        if (result.getRequestBody() != null) {
+            r.setRequestBodyLength(result.getRequestBody().length());
+            r.setRequestBodyPreview(preview(result.getRequestBody()));
+        }
+        if (result.getResponseBody() != null) {
+            r.setResponseBodyLength(result.getResponseBody().length());
+            r.setResponseBodyPreview(preview(result.getResponseBody()));
         }
         if (payload != null) {
             r.setGoal(payload.getGoal());
@@ -45,5 +67,12 @@ public class ScanResultResponse {
             r.setPayloadContent(payload.getContent());
         }
         return r;
+    }
+
+    private static String preview(String text) {
+        if (text == null) {
+            return null;
+        }
+        return text.length() <= 500 ? text : text.substring(0, 500) + "…";
     }
 }

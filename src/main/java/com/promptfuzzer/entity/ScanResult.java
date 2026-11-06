@@ -40,6 +40,21 @@ public class ScanResult {
     @Column(columnDefinition = "TEXT")
     private String rawJudgeResponse;
 
+    @Column(length = 32)
+    private String executionChannel;
+
+    private Long replayProfileId;
+
+    @Column(length = 32)
+    private String replayProfileClassification;
+
+    private Integer statusCode;
+
+    @Column(length = 160)
+    private String contentType;
+
+    private Integer targetChatIndex;
+
     public enum Verdict {
         SUCCESS, FAIL, UNCERTAIN
     }

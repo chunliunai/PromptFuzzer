@@ -2,6 +2,7 @@ package com.promptfuzzer.agent.workflow;
 
 import com.promptfuzzer.agent.workflow.node.AnalyzeNode;
 import com.promptfuzzer.agent.workflow.node.ExecuteTargetNode;
+import com.promptfuzzer.agent.workflow.node.ExtractTargetResponseNode;
 import com.promptfuzzer.agent.workflow.node.GeneratePayloadNode;
 import com.promptfuzzer.agent.workflow.node.JudgeOrExtractNode;
 import com.promptfuzzer.agent.workflow.node.MemoryDeltaNode;
@@ -9,6 +10,8 @@ import com.promptfuzzer.entity.AgentSession;
 import com.promptfuzzer.entity.Task;
 import com.promptfuzzer.service.AgentPlannerService;
 import com.promptfuzzer.service.JudgeService;
+import com.promptfuzzer.service.TargetExecutionRouter;
+import com.promptfuzzer.service.TargetResponseNormalizerService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +32,7 @@ class AgentWorkflowTurnCoordinatorTest {
     private AnalyzeNode analyzeNode;
     private GeneratePayloadNode generatePayloadNode;
     private ExecuteTargetNode executeTargetNode;
+    private ExtractTargetResponseNode extractTargetResponseNode;
     private JudgeOrExtractNode judgeOrExtractNode;
     private MemoryDeltaNode memoryDeltaNode;
     private AgentWorkflowTurnCoordinator coordinator;
@@ -38,10 +42,27 @@ class AgentWorkflowTurnCoordinatorTest {
         analyzeNode = mock(AnalyzeNode.class);
         generatePayloadNode = mock(GeneratePayloadNode.class);
         executeTargetNode = mock(ExecuteTargetNode.class);
+        extractTargetResponseNode = mock(ExtractTargetResponseNode.class);
         judgeOrExtractNode = mock(JudgeOrExtractNode.class);
         memoryDeltaNode = mock(MemoryDeltaNode.class);
         coordinator = new AgentWorkflowTurnCoordinator(
-                analyzeNode, generatePayloadNode, executeTargetNode, judgeOrExtractNode, memoryDeltaNode);
+                analyzeNode, generatePayloadNode, executeTargetNode, extractTargetResponseNode,
+                judgeOrExtractNode, memoryDeltaNode);
+        when(extractTargetResponseNode.execute(any(), any(), any(), any(), any(), org.mockito.ArgumentMatchers.anyBoolean()))
+                .thenAnswer(invocation -> {
+                    String rawResponse = invocation.getArgument(2);
+                    String executionChannel = invocation.getArgument(4);
+                    return new TargetResponseNormalizerService.NormalizedTargetResponse(
+                            rawResponse,
+                            rawResponse,
+                            rawResponse,
+                            executionChannel,
+                            "TEXT",
+                            "TEXT_PASSTHROUGH",
+                            0.6,
+                            false,
+                            rawResponse != null ? rawResponse.length() : 0);
+                });
     }
 
     @Test
@@ -51,8 +72,12 @@ class AgentWorkflowTurnCoordinatorTest {
                 .thenReturn(analysis);
         when(generatePayloadNode.execute(any(), any(), eq(analysis), eq("none"),
                 eq("[]"), any(), eq(34L))).thenReturn("message");
-        when(executeTargetNode.sendBrowserMessage(any(), any(), eq(99L), eq("message")))
-                .thenReturn("response");
+        TargetExecutionRouter.TargetExecutionResult executionResult =
+                new TargetExecutionRouter.TargetExecutionResult();
+        executionResult.setRawResponse("response");
+        executionResult.setExecutionChannel("BROWSER");
+        when(executeTargetNode.sendBrowserMessageAuto(any(), any(), eq(99L), eq("message")))
+                .thenReturn(executionResult);
         JudgeService.JudgeResult judgeResult = judge("SUCCESS", "confirmed", "value");
         when(judgeOrExtractNode.execute(any(), any(), eq("judge"))).thenReturn(judgeResult);
 
@@ -74,8 +99,11 @@ class AgentWorkflowTurnCoordinatorTest {
                 eq("[]"), any(), eq(34L))).thenReturn("message");
         when(executeTargetNode.sendHttp(any(), any(), eq("template"), eq("message")))
                 .thenReturn("raw");
-        when(judgeOrExtractNode.execute(any(), any(), eq("extractOnly")))
-                .thenReturn(judge(null, null, "extracted"));
+        when(extractTargetResponseNode.execute(any(), any(), eq("raw"), any(), eq("HTTP_TEMPLATE"),
+                org.mockito.ArgumentMatchers.anyBoolean()))
+                .thenReturn(new TargetResponseNormalizerService.NormalizedTargetResponse(
+                        "raw", "raw", "extracted", "HTTP_TEMPLATE",
+                        "TEXT", "AI_EXTRACT_ONLY", 0.8, true, 3));
         when(memoryDeltaNode.execute(any(), any())).thenReturn("next-signals");
 
         WorkflowNodeResult<AgentWorkflowTurnOutput> result =
@@ -100,7 +128,7 @@ class AgentWorkflowTurnCoordinatorTest {
         assertEquals(WorkflowRoute.STOP, result.getRoute());
         assertEquals("done", result.getEvidence());
         verify(generatePayloadNode, never()).execute(any(), any(), any(), any(), any(), any(), any());
-        verify(executeTargetNode, never()).sendBrowserMessage(any(), any(), any(), any());
+        verify(executeTargetNode, never()).sendBrowserMessageAuto(any(), any(), any(), any());
     }
 
     private AgentWorkflowTurnRequest request(boolean browser, String phase) {

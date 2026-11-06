@@ -9,6 +9,7 @@ import com.promptfuzzer.repository.AgentSessionRepository;
 import com.promptfuzzer.repository.AgentWorkflowTraceRepository;
 import com.promptfuzzer.repository.OobTargetRepository;
 import com.promptfuzzer.repository.ReconAttackCandidateRepository;
+import com.promptfuzzer.repository.ReplayProfileRepository;
 import com.promptfuzzer.repository.ScanPayloadRepository;
 import com.promptfuzzer.repository.ScanResultRepository;
 import com.promptfuzzer.repository.TaskRepository;
@@ -42,6 +43,8 @@ class TaskServiceReconIntegrationTest {
             mock(AgentStrategySnapshotRepository.class);
     private final ReconAttackCandidateRepository candidateRepository =
             mock(ReconAttackCandidateRepository.class);
+    private final ReplayProfileRepository replayProfileRepository =
+            mock(ReplayProfileRepository.class);
     private final AgentSessionExecutor sessionExecutor =
             mock(AgentSessionExecutor.class);
     private final ReconIntelligenceService reconIntelligenceService =
@@ -55,9 +58,12 @@ class TaskServiceReconIntegrationTest {
             traceRepository,
             snapshotRepository,
             candidateRepository,
+            replayProfileRepository,
             mock(ScanExecutorService.class),
             sessionExecutor,
             mock(AutoModeService.class),
+            mock(BrowserSingleTurnService.class),
+            mock(BrowserService.class),
             mock(PayloadGeneratorService.class),
             mock(OobService.class),
             reconIntelligenceService);
@@ -80,6 +86,7 @@ class TaskServiceReconIntegrationTest {
         verify(candidateRepository).saveAll(List.of(candidate));
         verify(traceRepository).deleteByTaskId(30L);
         verify(snapshotRepository).deleteByTaskId(30L);
+        verify(replayProfileRepository).deleteByTaskId(30L);
         verify(sessionRepository).deleteByTaskId(30L);
         verify(resultRepository).deleteByTaskId(30L);
         verify(payloadRepository).deleteByTaskId(30L);

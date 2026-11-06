@@ -16,6 +16,9 @@ public class BrowserTargetConfig {
     /** 登录配置（airedlab 目前为 null，后续扩展用） */
     private Map<String, String> login;
 
+    /** 登录验证配置: { successSelector, loginPageSelector, passwordSelector, captchaSelector } */
+    private Map<String, String> loginCheck;
+
     /** 等待 AI 回复超时 (ms)，默认 15000 */
     private int waitTimeoutMs = 45000;
 

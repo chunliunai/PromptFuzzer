@@ -1,21 +1,26 @@
 package com.promptfuzzer.service;
 
 import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.Cookie;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.promptfuzzer.config.BrowserTargetConfig;
+import com.promptfuzzer.entity.BrowserTargetProfile;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 @Slf4j
 @Service
@@ -35,14 +40,31 @@ public class BrowserService {
             "input[type=\"submit\"]:visible",
             "button[aria-label*=\"send\" i]:visible",
             "button[title*=\"send\" i]:visible",
-            "button[data-testid*=\"send\" i]:visible"
+            "button[data-testid*=\"send\" i]:visible",
+            "button:has(svg[class*=\"lucide-arrow-up\"]):visible"
+    );
+    private static final List<String> DEFAULT_LOGIN_BLOCKING_SELECTORS = List.of(
+            "input[type=\"password\"]:visible",
+            "input[autocomplete*=\"one-time-code\" i]:visible",
+            "input[name*=\"otp\" i]:visible",
+            "input[name*=\"verify\" i]:visible",
+            "input[name*=\"verification\" i]:visible",
+            "input[name*=\"captcha\" i]:visible",
+            "input[placeholder*=\"验证码\" i]:visible",
+            "input[placeholder*=\"verification\" i]:visible",
+            "input[placeholder*=\"captcha\" i]:visible",
+            "[class*=\"captcha\" i]:visible",
+            "[id*=\"captcha\" i]:visible",
+            "iframe[src*=\"captcha\" i]:visible"
     );
 
     private Playwright playwright;
-    private volatile CountDownLatch authLatch;
+    @Autowired(required = false)
+    private BrowserTargetProfileService targetProfileService;
 
     /** sessionId → { page, config } */
     private final Map<Long, SessionState> sessions = new ConcurrentHashMap<>();
+    private final Map<String, LoginSession> loginSessions = new ConcurrentHashMap<>();
 
     private static class SessionState {
         Page page;
@@ -50,12 +72,21 @@ public class BrowserService {
         SharedContext sharedContext;
         BrowserTargetConfig config;
         String targetType;
+        Map<String, Map<String, String>> replayHeadersByOrigin = new ConcurrentHashMap<>();
     }
 
     private static class SharedContext {
         BrowserContext context;
         int refCount = 1;
     }
+
+    private static class LoginSession {
+        BrowserContext context;
+        Page page;
+        BrowserTargetConfig config;
+    }
+
+    private record LoginVerification(boolean verified, String reason) {}
 
     /**
      * Open a browser session for the agent. Manual login is opt-in through
@@ -70,6 +101,7 @@ public class BrowserService {
 
         SessionState reusable = findReusableSession(config);
         if (reusable != null) {
+            targetProfileService().requireVerifiedForExecution(config);
             createForkedSession(sessionId, reusable, config);
             return;
         }
@@ -79,35 +111,16 @@ public class BrowserService {
             Files.createDirectories(AUTH_DIR);
             initPlaywright();
 
-            Path userDataDir = AUTH_DIR.resolve(config.getTargetType() + "-profile");
-            Path authFile = AUTH_DIR.resolve(config.getTargetType() + "-auth.json");
-            boolean hasLoggedInBefore = Files.exists(authFile);
+            targetProfileService().upsertFromConfig(config, null);
             boolean manualLoginRequired = isManualLoginRequired(config);
-
-            context = createContext(userDataDir, authFile, hasLoggedInBefore);
-
-            if (manualLoginRequired && !hasLoggedInBefore) {
-                // --- First time: pop up browser for manual login ---
-                log.info("No auth for '{}', opening browser for manual login...", config.getTargetType());
-                Page loginPage = preparePrimaryPage(context);
-                navigateToChat(loginPage, config);
-                log.info("==============================================");
-                log.info("  浏览器已打开，请完成目标站点登录。");
-                log.info("  登录完成后，调用: curl -X POST http://localhost:9091/api/browser/auth-ready");
-                log.info("==============================================");
-                System.out.println("\n>>> 请完成目标站点登录，然后通知后端登录完成 <<<");
-                authLatch = new CountDownLatch(1);
-                try {
-                    authLatch.await(300, TimeUnit.SECONDS);
-                } catch (InterruptedException ignored) {}
-
-                // Save auth state marker
-                Files.writeString(authFile, "logged-in");
-                log.info("Auth saved to {}", authFile.toAbsolutePath());
-            } else {
-                log.info("Browser target '{}' starts without manual login wait (required={}, saved={})",
-                        config.getTargetType(), manualLoginRequired, hasLoggedInBefore);
+            if (manualLoginRequired) {
+                targetProfileService().requireVerifiedForExecution(config);
             }
+            Path userDataDir = targetProfileService().profilePathForConfig(config);
+
+            context = createContext(userDataDir);
+            log.info("Browser target '{}' starts execution with manualLoginRequired={}",
+                    config.getTargetType(), manualLoginRequired);
 
             Page page = preparePrimaryPage(context);
             navigateToChat(page, config);
@@ -117,6 +130,16 @@ public class BrowserService {
             // Verify input selector is visible
             String inputSelector = getSelector(config, "input");
             page.waitForSelector(inputSelector, new Page.WaitForSelectorOptions().setTimeout(10000));
+
+            if (manualLoginRequired) {
+                LoginVerification verification = verifyLoginState(page, config);
+                if (!verification.verified()) {
+                    targetProfileService().markExpired(config.getTargetType(), verification.reason());
+                    throw new IllegalStateException("Stored login is not usable for targetType="
+                            + config.getTargetType() + ": " + verification.reason());
+                }
+                targetProfileService().markVerified(config.getTargetType());
+            }
             log.info("Browser session {} ready — input '{}' visible", sessionId, inputSelector);
 
             SessionState state = new SessionState();
@@ -141,6 +164,7 @@ public class BrowserService {
             Long sourceSessionId,
             Long targetSessionId,
             BrowserTargetConfig config) {
+        targetProfileService().requireVerifiedForExecution(config);
         if (sessions.containsKey(targetSessionId)) {
             return;
         }
@@ -159,35 +183,92 @@ public class BrowserService {
         return sessions.containsKey(sessionId);
     }
 
+    public String cookieHeaderForUrl(Long sessionId, String url) {
+        SessionState state = sessions.get(sessionId);
+        if (state == null || state.context == null || url == null || url.isBlank()) {
+            return "";
+        }
+        try {
+            URI uri = URI.create(url);
+            String host = uri.getHost();
+            String path = uri.getPath() != null && !uri.getPath().isBlank()
+                    ? uri.getPath() : "/";
+            List<Cookie> cookies = state.context.cookies(List.of(url));
+            StringBuilder header = new StringBuilder();
+            for (Cookie cookie : cookies) {
+                if (!matchesCookie(cookie, host, path)) {
+                    continue;
+                }
+                if (header.length() > 0) {
+                    header.append("; ");
+                }
+                header.append(cookie.name).append("=").append(cookie.value);
+            }
+            return header.toString();
+        } catch (Exception e) {
+            log.debug("Browser session {} cookie extraction failed: {}", sessionId, e.getMessage());
+            return "";
+        }
+    }
+
+    public Map<String, String> dynamicReplayHeadersForUrl(Long sessionId, String url) {
+        SessionState state = sessions.get(sessionId);
+        if (state == null || url == null || url.isBlank()) {
+            return Map.of();
+        }
+        try {
+            String origin = originKey(url);
+            Map<String, String> headers = state.replayHeadersByOrigin.get(origin);
+            return headers != null ? new HashMap<>(headers) : Map.of();
+        } catch (Exception e) {
+            log.debug("Browser session {} dynamic replay header extraction failed: {}",
+                    sessionId, e.getMessage());
+            return Map.of();
+        }
+    }
+
     /**
      * Tool: browser_send_message — type message in input, send, wait for AI reply, return text.
      */
     public String sendMessage(Long sessionId, String message) {
+        BrowserMessageResult result = sendMessageWithCapture(sessionId, message);
+        return result != null ? result.responseText() : null;
+    }
+
+    /**
+     * Send a message through the browser and return both the DOM-extracted response and
+     * a best-effort network capture for the send window. This is observational only:
+     * browser behavior and response semantics stay unchanged.
+     */
+    public BrowserMessageResult sendMessageWithCapture(Long sessionId, String message) {
         SessionState state = sessions.get(sessionId);
         if (state == null) throw new IllegalStateException("No browser session: " + sessionId);
 
         BrowserTargetConfig config = state.config;
+        targetProfileService().requireVerifiedForExecution(config);
         Page page = state.page;
+        NetworkCapture capture = new NetworkCapture(state, page, message);
 
         try {
             String inputSelector = getSelector(config, "input");
             String submitSelector = getSelector(config, "submit");
             waitForInputReady(page, config, 10_000);
+            capture.start();
 
             // Type into input
             Locator input = page.locator(inputSelector).first();
-            input.click(new Locator.ClickOptions().setTimeout(3000));
-            input.fill(message);
+            typeMessage(page, input, inputSelector, message);
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
 
             String responseSelector = getResponseSelector(config);
             String assistantSnapshot = readLastAssistantMessageText(page, config);
 
             // Capture the baseline before submission. Some refusals render so fast
             // that a post-submit snapshot already contains the model response.
-            String snapshot = page.locator(responseSelector).innerText();
-            String bodySnapshot = "body".equals(responseSelector) ? snapshot : page.locator("body").innerText();
+            String snapshot = readInnerText(page, responseSelector);
+            String bodySnapshot = "body".equals(responseSelector) ? snapshot : readInnerText(page, "body");
 
-            // Send: prefer submit button when enabled, otherwise fall back to Enter.
+            // Veda's icon buttons share broad classes; Enter is the stable send path there.
             submitMessage(page, inputSelector, submitSelector);
 
             // Let the submitted message render into page DOM before polling.
@@ -203,11 +284,15 @@ public class BrowserService {
             log.info("Browser session {} got response ({} chars)", sessionId,
                     responseText != null ? responseText.length() : 0);
 
-            return responseText;
+            List<TrafficExchange> exchanges = capture.stop();
+            logNetworkCaptureSummary(sessionId, exchanges);
+            return new BrowserMessageResult(responseText, exchanges);
 
         } catch (Exception e) {
             log.error("Browser session {} sendMessage failed", sessionId, e);
-            return null;
+            List<TrafficExchange> exchanges = capture.stop();
+            logNetworkCaptureSummary(sessionId, exchanges);
+            return new BrowserMessageResult(null, exchanges);
         }
     }
 
@@ -303,14 +388,100 @@ public class BrowserService {
         }
     }
 
-    /**
-     * Signal that manual login has been completed. Unblocks the waiting agent thread.
-     */
-    public void signalAuthReady() {
-        if (authLatch != null) {
-            authLatch.countDown();
-            log.info("Auth ready signal received");
+    public synchronized BrowserTargetProfile startLogin(BrowserTargetConfig config) {
+        if (config == null || config.getChatUrl() == null || config.getChatUrl().isBlank()) {
+            throw new IllegalArgumentException("targetConfig.chatUrl is required");
         }
+        if (config.getTargetType() == null || config.getTargetType().isBlank()) {
+            config.setTargetType("default");
+        }
+        closeLoginSession(config.getTargetType());
+        BrowserContext context = null;
+        try {
+            Files.createDirectories(AUTH_DIR);
+            initPlaywright();
+            BrowserTargetProfile profile = targetProfileService().markWaitingLogin(config);
+            context = createContext(targetProfileService().profilePathForConfig(config));
+            Page page = preparePrimaryPage(context);
+            navigateToChat(page, config);
+
+            LoginSession loginSession = new LoginSession();
+            loginSession.context = context;
+            loginSession.page = page;
+            loginSession.config = config;
+            loginSessions.put(config.getTargetType(), loginSession);
+            log.info("Manual login session opened for targetType '{}'", config.getTargetType());
+            return profile;
+        } catch (Exception e) {
+            if (context != null) {
+                try { context.close(); } catch (Exception ignored) {}
+            }
+            targetProfileService().markFailed(config.getTargetType(), e.getMessage());
+            throw new RuntimeException("Manual login start failed: " + e.getMessage(), e);
+        }
+    }
+
+    public synchronized BrowserTargetProfile signalAuthReady(String targetType) {
+        LoginSession loginSession = loginSessions.get(targetType);
+        BrowserTargetConfig config = loginSession != null
+                ? loginSession.config
+                : targetProfileService().configFromProfile(targetType);
+        BrowserContext context = null;
+        boolean ownsContext = false;
+        try {
+            targetProfileService().markVerifying(config.getTargetType());
+            Page page;
+            if (loginSession != null && loginSession.page != null && !loginSession.page.isClosed()) {
+                page = loginSession.page;
+            } else {
+                Files.createDirectories(AUTH_DIR);
+                initPlaywright();
+                context = createContext(targetProfileService().profilePathForConfig(config));
+                ownsContext = true;
+                page = preparePrimaryPage(context);
+            }
+
+            navigateToChatForVerification(page, config);
+            LoginVerification verification = verifyLoginState(page, config);
+            if (!verification.verified()) {
+                return targetProfileService().markFailed(config.getTargetType(), verification.reason());
+            }
+
+            BrowserTargetProfile profile = targetProfileService().markVerified(config.getTargetType());
+            closeLoginSession(config.getTargetType());
+            if (ownsContext && context != null) {
+                context.close();
+            }
+            log.info("Manual login verified for targetType '{}'", config.getTargetType());
+            return profile;
+        } catch (Exception e) {
+            return targetProfileService().markFailed(config.getTargetType(), e.getMessage());
+        } finally {
+            if (ownsContext && context != null) {
+                try { context.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Legacy endpoint support. Prefer signalAuthReady(targetType) from the UI.
+     */
+    public BrowserTargetProfile signalAuthReady() {
+        if (loginSessions.size() == 1) {
+            String targetType = loginSessions.keySet().iterator().next();
+            return signalAuthReady(targetType);
+        }
+        throw new IllegalStateException("targetType is required when zero or multiple login sessions are active");
+    }
+
+    public synchronized BrowserTargetProfile clearAuthState(String targetType) {
+        closeLoginSession(targetType);
+        targetProfileService().findByTargetType(targetType).ifPresent(profile -> {
+            if (profile.getProfilePath() != null && !profile.getProfilePath().isBlank()) {
+                deleteDirectory(Path.of(profile.getProfilePath()));
+            }
+        });
+        return targetProfileService().resetAuthState(targetType);
     }
 
     /**
@@ -328,6 +499,13 @@ public class BrowserService {
         if (playwright != null) return;
         playwright = Playwright.create();
         log.info("Playwright initialized");
+    }
+
+    private BrowserTargetProfileService targetProfileService() {
+        if (targetProfileService == null) {
+            throw new IllegalStateException("BrowserTargetProfileService is not available");
+        }
+        return targetProfileService;
     }
 
     private void waitForInputReady(Page page, BrowserTargetConfig config, int timeoutMs) {
@@ -352,24 +530,103 @@ public class BrowserService {
         throw new RuntimeException("Input selector is not enabled: " + inputSelector);
     }
 
+    private boolean matchesCookie(Cookie cookie, String host, String path) {
+        if (cookie == null || cookie.name == null || cookie.value == null) {
+            return false;
+        }
+        if (host != null && cookie.domain != null && !cookie.domain.isBlank()) {
+            String cookieDomain = cookie.domain.startsWith(".")
+                    ? cookie.domain.substring(1) : cookie.domain;
+            if (!host.equals(cookieDomain) && !host.endsWith("." + cookieDomain)) {
+                return false;
+            }
+        }
+        if (path != null && cookie.path != null && !cookie.path.isBlank()
+                && !path.startsWith(cookie.path)) {
+            return false;
+        }
+        return true;
+    }
+
+    private String originKey(String url) {
+        URI uri = URI.create(url);
+        String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase() : "https";
+        String host = uri.getHost() != null ? uri.getHost().toLowerCase() : "";
+        int port = uri.getPort();
+        return port > 0 ? scheme + "://" + host + ":" + port : scheme + "://" + host;
+    }
+
     private void submitMessage(Page page, String inputSelector, String submitSelector) {
+        if (shouldSubmitWithEnterFirst(inputSelector, submitSelector)) {
+            pressEnterToSubmit(page, inputSelector);
+            log.info("Browser message submitted via Enter preferred for input '{}'", inputSelector);
+            return;
+        }
+
         if (submitSelector != null && !submitSelector.isBlank()) {
-            Locator submit = page.locator(submitSelector);
             try {
-                if (submit.isVisible(new Locator.IsVisibleOptions().setTimeout(1500)) && submit.isEnabled()) {
-                    submit.click(new Locator.ClickOptions().setTimeout(2000));
-                    return;
+                Locator submitButtons = page.locator(submitSelector);
+                int count = submitButtons.count();
+                for (int i = 0; i < count; i++) {
+                    Locator submit = submitButtons.nth(i);
+                    if (submit.isVisible(new Locator.IsVisibleOptions().setTimeout(1500))) {
+                        if (submit.isEnabled()) {
+                            submit.click(new Locator.ClickOptions().setTimeout(2000));
+                            log.info("Browser message submitted via selector '{}' at index {}", submitSelector, i);
+                            return;
+                        }
+                        log.debug("Submit selector '{}' matched disabled button at index {}", submitSelector, i);
+                    }
                 }
             } catch (Exception e) {
                 log.debug("Submit button click path unavailable, falling back to Enter: {}", e.getMessage());
             }
         }
 
+        pressEnterToSubmit(page, inputSelector);
+        log.info("Browser message submitted via Enter fallback");
+    }
+
+    private boolean shouldSubmitWithEnterFirst(String inputSelector, String submitSelector) {
+        String input = inputSelector == null ? "" : inputSelector.toLowerCase();
+        String submit = submitSelector == null ? "" : submitSelector.toLowerCase();
+        return input.contains("chat-editor-content")
+                || submit.equals(".chat-input-icon-button");
+    }
+
+    private void pressEnterToSubmit(Page page, String inputSelector) {
         if (inputSelector != null && !inputSelector.isBlank()) {
             page.locator(inputSelector).first().press("Enter");
         } else {
             page.keyboard().press("Enter");
         }
+    }
+
+    private void typeMessage(Page page, Locator input, String inputSelector, String message) {
+        input.click(new Locator.ClickOptions().setTimeout(3000));
+        if (isContentEditableInput(inputSelector)) {
+            try {
+                input.fill("");
+            } catch (Exception e) {
+                log.debug("Contenteditable clear via fill failed, using keyboard clear: {}", e.getMessage());
+            }
+            page.keyboard().press("Meta+A");
+            page.keyboard().press("Backspace");
+            page.keyboard().insertText(message);
+            log.info("Browser message typed via keyboard insertText for input '{}'", inputSelector);
+            return;
+        }
+        input.fill(message);
+    }
+
+    private boolean isContentEditableInput(String inputSelector) {
+        if (inputSelector == null) {
+            return false;
+        }
+        String lower = inputSelector.toLowerCase();
+        return lower.contains("contenteditable")
+                || lower.contains("prosemirror")
+                || lower.contains("chat-editor-content");
     }
 
     private void resetToChat(Page page, BrowserTargetConfig config) {
@@ -432,6 +689,9 @@ public class BrowserService {
     }
 
     boolean isManualLoginRequired(BrowserTargetConfig config) {
+        if (targetProfileService != null) {
+            return targetProfileService.isManualLoginRequired(config);
+        }
         if (config == null || config.getLogin() == null) {
             return false;
         }
@@ -475,6 +735,8 @@ public class BrowserService {
             state.sharedContext = source.sharedContext;
             state.config = config;
             state.targetType = config.getTargetType();
+            source.replayHeadersByOrigin.forEach((origin, headers) ->
+                    state.replayHeadersByOrigin.put(origin, new HashMap<>(headers)));
             sessions.put(sessionId, state);
             log.info("Browser session {} opened isolated page for targetType '{}', shared context refs={}",
                     sessionId, state.targetType, state.sharedContext.refCount);
@@ -511,11 +773,154 @@ public class BrowserService {
         }
     }
 
+    private LoginVerification verifyLoginState(Page page, BrowserTargetConfig config) {
+        String currentUrl = page.url();
+        if (looksLikeLoginUrl(currentUrl)) {
+            return new LoginVerification(false, "Current URL still looks like a login page: " + currentUrl);
+        }
+
+        String loginPageSelector = loginCheckValue(config, "loginPageSelector");
+        if (isSelectorVisible(page, loginPageSelector)) {
+            return new LoginVerification(false, "Login page selector is still visible: " + loginPageSelector);
+        }
+        String passwordSelector = loginCheckValue(config, "passwordSelector");
+        if (isSelectorVisible(page, passwordSelector)) {
+            return new LoginVerification(false, "Password selector is still visible: " + passwordSelector);
+        }
+        String captchaSelector = loginCheckValue(config, "captchaSelector");
+        if (isSelectorVisible(page, captchaSelector)) {
+            return new LoginVerification(false, "Captcha selector is still visible: " + captchaSelector);
+        }
+        String defaultBlockingSelector = visibleDefaultLoginBlockingSelector(page);
+        if (!isBlank(defaultBlockingSelector)) {
+            return new LoginVerification(false, "Login verification blocker is still visible: " + defaultBlockingSelector);
+        }
+
+        String successSelector = loginCheckValue(config, "successSelector");
+        if (!isBlank(successSelector) && !waitForSelectorVisible(page, successSelector, 12_000)) {
+            return new LoginVerification(false, "Success selector is not visible: " + successSelector);
+        }
+
+        try {
+            resolveDefaultSelectors(page, config);
+            String inputSelector = getSelector(config, "input");
+            if (isBlank(inputSelector) || !waitForSelectorVisible(page, inputSelector, 12_000)) {
+                return new LoginVerification(false, "Chat input selector is not visible");
+            }
+            if (isBlank(successSelector) && !looksLikeChatInputSelector(inputSelector)) {
+                return new LoginVerification(false,
+                        "Chat input selector is too generic for login verification; configure loginCheck.successSelector");
+            }
+        } catch (Exception e) {
+            return new LoginVerification(false, "Chat input verification failed: " + e.getMessage());
+        }
+        return new LoginVerification(true, null);
+    }
+
+    private boolean looksLikeLoginUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return false;
+        }
+        String lower = url.toLowerCase();
+        return lower.contains("/login")
+                || lower.contains("/signin")
+                || lower.contains("/sign-in")
+                || lower.contains("/auth")
+                || lower.contains("/oauth")
+                || lower.contains("/sso")
+                || lower.contains("captcha")
+                || lower.contains("verify");
+    }
+
+    private String visibleDefaultLoginBlockingSelector(Page page) {
+        for (String selector : DEFAULT_LOGIN_BLOCKING_SELECTORS) {
+            if (isSelectorVisible(page, selector)) {
+                return selector;
+            }
+        }
+        return null;
+    }
+
+    private boolean looksLikeChatInputSelector(String selector) {
+        if (selector == null) {
+            return false;
+        }
+        String lower = selector.toLowerCase();
+        return lower.contains("textarea")
+                || lower.contains("contenteditable")
+                || lower.contains("role=\"textbox\"")
+                || lower.contains("role='textbox'")
+                || lower.contains("[role=textbox]");
+    }
+
+    private String loginCheckValue(BrowserTargetConfig config, String key) {
+        if (config == null) {
+            return null;
+        }
+        if (config.getLoginCheck() != null && !isBlank(config.getLoginCheck().get(key))) {
+            return config.getLoginCheck().get(key);
+        }
+        if (config.getLogin() != null && !isBlank(config.getLogin().get(key))) {
+            return config.getLogin().get(key);
+        }
+        return null;
+    }
+
+    private boolean isSelectorVisible(Page page, String selector) {
+        if (isBlank(selector)) {
+            return false;
+        }
+        try {
+            return page.locator(selector).first().isVisible();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean waitForSelectorVisible(Page page, String selector, int timeoutMs) {
+        if (isBlank(selector)) {
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (isSelectorVisible(page, selector)) {
+                return true;
+            }
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
     private void navigateToChat(Page page, BrowserTargetConfig config) {
         int timeoutMs = Math.max(config.getWaitTimeoutMs(), 45_000);
         page.navigate(config.getChatUrl(), new Page.NavigateOptions()
                 .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                 .setTimeout(timeoutMs));
+    }
+
+    private void navigateToChatForVerification(Page page, BrowserTargetConfig config) {
+        navigateToChat(page, config);
+        long deadline = System.currentTimeMillis() + 10_000;
+        String successSelector = loginCheckValue(config, "successSelector");
+        while (System.currentTimeMillis() < deadline) {
+            if (!looksLikeLoginUrl(page.url()) && waitForSelectorVisible(page, successSelector, 250)) {
+                return;
+            }
+            if (!looksLikeLoginUrl(page.url()) && isBlank(successSelector)) {
+                return;
+            }
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     /**
@@ -547,7 +952,7 @@ public class BrowserService {
      * Create a BrowserContext with anti-detection measures.
      * Uses a persistent user data directory to look like a normal browser.
      */
-    private BrowserContext createContext(Path userDataDir, Path authFile, boolean restoreAuth) {
+    private BrowserContext createContext(Path userDataDir) {
         // Build args with optional proxy
         List<String> argsList = new ArrayList<>(Arrays.asList(
                 "--disable-blink-features=AutomationControlled",
@@ -571,16 +976,37 @@ public class BrowserService {
         BrowserContext context = playwright.chromium()
                 .launchPersistentContext(userDataDir, options);
 
-        // If we have saved auth, inject it
-        if (restoreAuth && Files.exists(authFile)) {
-            try {
-                String authJson = Files.readString(authFile);
-                // Restore is automatic with the persistent context above
-                log.info("Using persistent context from {}", userDataDir);
-            } catch (Exception ignored) {}
-        }
+        log.info("Using persistent context from {}", userDataDir);
 
         return context;
+    }
+
+    private void closeLoginSession(String targetType) {
+        LoginSession loginSession = loginSessions.remove(targetType);
+        if (loginSession != null && loginSession.context != null) {
+            try {
+                loginSession.context.close();
+            } catch (Exception e) {
+                log.warn("Error closing login session for targetType '{}'", targetType, e);
+            }
+        }
+    }
+
+    private void deleteDirectory(Path path) {
+        if (path == null || !Files.exists(path)) {
+            return;
+        }
+        try (var stream = Files.walk(path)) {
+            stream.sorted(Comparator.reverseOrder()).forEach(item -> {
+                try {
+                    Files.deleteIfExists(item);
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to delete " + item, e);
+                }
+            });
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to delete profile directory " + path, e);
+        }
     }
 
     /**
@@ -652,7 +1078,7 @@ public class BrowserService {
             }
         }
 
-        String currentBody = page.locator(responseSelector).innerText();
+        String currentBody = readInnerText(page, responseSelector);
         log.warn("Response wait timed out after {}ms, selector='{}', snapshot={} current={} chars",
                 timeoutMs, responseSelector,
                 snapshot != null ? snapshot.length() : 0,
@@ -775,7 +1201,12 @@ public class BrowserService {
     }
 
     private String readInnerText(Page page, String selector) {
-        return page.locator(selector).innerText(new Locator.InnerTextOptions().setTimeout(5000));
+        try {
+            return page.locator(selector).innerText(new Locator.InnerTextOptions().setTimeout(1000));
+        } catch (Exception e) {
+            log.debug("Selector '{}' text unavailable: {}", selector, e.getMessage());
+            return "";
+        }
     }
 
     private String preview(String text, int maxLen) {
@@ -960,5 +1391,329 @@ public class BrowserService {
         if (text == null || text.isBlank()) return "";
         // Remove excessive whitespace
         return text.replaceAll("\\s+", " ").trim();
+    }
+
+    private void logNetworkCaptureSummary(Long sessionId, List<TrafficExchange> exchanges) {
+        if (exchanges == null || exchanges.isEmpty()) {
+            log.info("Browser session {} network capture found no candidate exchanges", sessionId);
+            return;
+        }
+        TrafficExchange top = exchanges.get(0);
+        log.info("Browser session {} network capture candidates={}, topScore={}, top={} {}",
+                sessionId, exchanges.size(), top.score(), top.method(), top.urlPreview());
+    }
+
+    private class NetworkCapture {
+        private static final int MAX_CAPTURED_EXCHANGES = 20;
+        private static final int MAX_BODY_PREVIEW_CHARS = 1200;
+        private static final int MAX_HEADER_PREVIEW_CHARS = 1200;
+
+        private final SessionState sessionState;
+        private final Page page;
+        private final String submittedMessage;
+        private final Map<Request, MutableTrafficExchange> exchanges = new ConcurrentHashMap<>();
+        private Consumer<Request> requestHandler;
+        private Consumer<Request> requestFinishedHandler;
+        private boolean started;
+
+        private NetworkCapture(SessionState sessionState, Page page, String submittedMessage) {
+            this.sessionState = sessionState;
+            this.page = page;
+            this.submittedMessage = submittedMessage;
+        }
+
+        private void start() {
+            if (started) {
+                return;
+            }
+            started = true;
+            requestHandler = request -> {
+                try {
+                    MutableTrafficExchange exchange = exchanges.computeIfAbsent(
+                            request, ignored -> new MutableTrafficExchange());
+                    exchange.method = request.method();
+                    exchange.url = request.url();
+                    exchange.resourceType = request.resourceType();
+                    exchange.requestHeadersRaw = formatHeaders(request.headers());
+                    exchange.requestHeadersPreview = redactHeaders(request.headers());
+                    String postData = request.postData();
+                    exchange.requestBodyRaw = postData != null ? postData : "";
+                    exchange.requestBodyPreview = redactBody(postData);
+                    exchange.requestBodyChars = postData != null ? postData.length() : 0;
+                    exchange.promptInRequest = containsSubmittedMessage(postData);
+                    if (exchange.promptInRequest) {
+                        rememberReplayHeaders(request.url(), request.headers());
+                    }
+                    exchange.startedAtMs = System.currentTimeMillis();
+                    exchange.score = score(exchange);
+                } catch (Exception e) {
+                    log.debug("Browser network request capture failed: {}", e.getMessage());
+                }
+            };
+            requestFinishedHandler = request -> {
+                try {
+                    MutableTrafficExchange exchange = exchanges.computeIfAbsent(
+                            request, ignored -> new MutableTrafficExchange());
+                    if (exchange.url == null) {
+                        exchange.method = request.method();
+                        exchange.url = request.url();
+                        exchange.resourceType = request.resourceType();
+                    }
+                    Response response = request.response();
+                    if (response != null) {
+                        exchange.status = response.status();
+                        exchange.responseHeadersPreview = redactHeaders(response.headers());
+                        String contentType = response.headers().getOrDefault("content-type", "");
+                        if (shouldReadResponseBody(exchange, contentType)) {
+                            String responseText = response.text();
+                            exchange.responseBodyPreview = redactBody(responseText);
+                            exchange.responseBodyChars = responseText != null ? responseText.length() : 0;
+                            exchange.responseContentType = contentType;
+                        } else {
+                            exchange.responseContentType = contentType;
+                        }
+                    }
+                    exchange.completedAtMs = System.currentTimeMillis();
+                    exchange.score = score(exchange);
+                } catch (Exception e) {
+                    log.debug("Browser network response capture failed: {}", e.getMessage());
+                }
+            };
+            page.onRequest(requestHandler);
+            page.onRequestFinished(requestFinishedHandler);
+        }
+
+        private List<TrafficExchange> stop() {
+            if (started) {
+                if (requestHandler != null) {
+                    try { page.offRequest(requestHandler); } catch (Exception ignored) {}
+                }
+                if (requestFinishedHandler != null) {
+                    try { page.offRequestFinished(requestFinishedHandler); } catch (Exception ignored) {}
+                }
+                started = false;
+            }
+            return exchanges.values().stream()
+                    .map(exchange -> {
+                        exchange.score = score(exchange);
+                        return exchange.toTrafficExchange();
+                    })
+                    .filter(exchange -> exchange.score() > 0)
+                    .sorted(Comparator.comparingInt(TrafficExchange::score).reversed())
+                    .limit(MAX_CAPTURED_EXCHANGES)
+                    .toList();
+        }
+
+        private boolean shouldReadResponseBody(MutableTrafficExchange exchange, String contentType) {
+            String normalizedType = contentType != null ? contentType.toLowerCase() : "";
+            if (normalizedType.contains("event-stream")) {
+                return false;
+            }
+            return exchange.promptInRequest
+                    || exchange.score >= 3
+                    || normalizedType.contains("json")
+                    || normalizedType.contains("text/")
+                    || normalizedType.contains("ndjson");
+        }
+
+        private boolean containsSubmittedMessage(String text) {
+            return text != null && submittedMessage != null && !submittedMessage.isBlank()
+                    && text.contains(submittedMessage);
+        }
+
+        private int score(MutableTrafficExchange exchange) {
+            int score = 0;
+            String method = safeLower(exchange.method);
+            String url = safeLower(exchange.url);
+            String resourceType = safeLower(exchange.resourceType);
+            String contentType = safeLower(exchange.responseContentType);
+
+            if ("post".equals(method)) score += 2;
+            if (exchange.promptInRequest) score += 5;
+            if (resourceType.equals("xhr") || resourceType.equals("fetch")
+                    || resourceType.equals("eventsource")) score += 2;
+            if (url.matches(".*(chat|conversation|completion|message|stream|agent|ask).*")) score += 2;
+            if (contentType.contains("json") || contentType.contains("event-stream")
+                    || contentType.contains("text/")) score += 1;
+            if (url.matches(".*(\\.png|\\.jpg|\\.jpeg|\\.gif|\\.svg|\\.css|\\.js|\\.woff|\\.ico)(\\?.*)?$")) score -= 4;
+            if (url.matches(".*(log|track|metric|analytics|beacon|sentry|slardar|collect).*")) score -= 2;
+            return Math.max(score, 0);
+        }
+
+        private String redactHeaders(Map<String, String> headers) {
+            if (headers == null || headers.isEmpty()) {
+                return "";
+            }
+            StringBuilder builder = new StringBuilder();
+            headers.forEach((name, value) -> {
+                if (builder.length() > MAX_HEADER_PREVIEW_CHARS) {
+                    return;
+                }
+                builder.append(name).append(": ");
+                if (isSensitiveHeader(name)) {
+                    builder.append("[REDACTED]");
+                } else {
+                    builder.append(preview(value, 160));
+                }
+                builder.append("\n");
+            });
+            return preview(builder.toString(), MAX_HEADER_PREVIEW_CHARS);
+        }
+
+        private String formatHeaders(Map<String, String> headers) {
+            if (headers == null || headers.isEmpty()) {
+                return "";
+            }
+            StringBuilder builder = new StringBuilder();
+            headers.forEach((name, value) ->
+                    builder.append(name).append(": ")
+                            .append(value != null ? value : "")
+                            .append("\n"));
+            return builder.toString();
+        }
+
+        private boolean isSensitiveHeader(String name) {
+            if (name == null) return false;
+            String lower = name.toLowerCase();
+            return lower.contains("authorization")
+                    || lower.contains("cookie")
+                    || lower.contains("token")
+                    || lower.contains("csrf")
+                    || lower.contains("secret")
+                    || lower.contains("signature");
+        }
+
+        private void rememberReplayHeaders(String url, Map<String, String> headers) {
+            if (sessionState == null || headers == null || headers.isEmpty()) {
+                return;
+            }
+            Map<String, String> replayHeaders = new HashMap<>();
+            headers.forEach((name, value) -> {
+                if (isForwardableReplayHeader(name) && value != null && !value.isBlank()) {
+                    replayHeaders.put(name, value);
+                }
+            });
+            if (replayHeaders.isEmpty()) {
+                return;
+            }
+            try {
+                sessionState.replayHeadersByOrigin.put(originKey(url), replayHeaders);
+                log.debug("Stored {} in-memory replay header(s) for {}",
+                        replayHeaders.size(), originKey(url));
+            } catch (Exception e) {
+                log.debug("Failed to store dynamic replay headers: {}", e.getMessage());
+            }
+        }
+
+        private boolean isForwardableReplayHeader(String name) {
+            if (name == null) {
+                return false;
+            }
+            String lower = name.toLowerCase();
+            return !lower.equals("host")
+                    && !lower.equals("content-length")
+                    && !lower.equals("cookie")
+                    && !lower.equals("set-cookie")
+                    && !lower.equals("connection")
+                    && !lower.equals("keep-alive")
+                    && !lower.equals("proxy-authenticate")
+                    && !lower.equals("proxy-authorization")
+                    && !lower.equals("te")
+                    && !lower.equals("trailer")
+                    && !lower.equals("transfer-encoding")
+                    && !lower.equals("upgrade")
+                    && !lower.equals("accept-encoding");
+        }
+
+        private String redactBody(String body) {
+            if (body == null || body.isBlank()) {
+                return "";
+            }
+            String redacted = body
+                    .replaceAll("(?i)(\"(?:access_)?token\"\\s*:\\s*\")([^\"]+)(\")", "$1[REDACTED]$3")
+                    .replaceAll("(?i)(\"authorization\"\\s*:\\s*\")([^\"]+)(\")", "$1[REDACTED]$3")
+                    .replaceAll("(?i)(\"cookie\"\\s*:\\s*\")([^\"]+)(\")", "$1[REDACTED]$3")
+                    .replaceAll("(?i)(\"csrf[^\"]*\"\\s*:\\s*\")([^\"]+)(\")", "$1[REDACTED]$3")
+                    .replaceAll("(?i)((?:access_)?token=)[^&\\s]+", "$1[REDACTED]")
+                    .replaceAll("(?i)(authorization=)[^&\\s]+", "$1[REDACTED]")
+                    .replaceAll("(?i)(cookie=)[^&\\s]+", "$1[REDACTED]")
+                    .replaceAll("(?i)(csrf[^=]*=)[^&\\s]+", "$1[REDACTED]")
+                    .replaceAll("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]{12,}", "$1[REDACTED]");
+            return preview(redacted, MAX_BODY_PREVIEW_CHARS);
+        }
+
+        private String safeLower(String value) {
+            return value != null ? value.toLowerCase() : "";
+        }
+    }
+
+    private static class MutableTrafficExchange {
+        String method;
+        String url;
+        String resourceType;
+        String requestHeadersRaw;
+        String requestHeadersPreview;
+        String requestBodyRaw;
+        String requestBodyPreview;
+        int requestBodyChars;
+        boolean promptInRequest;
+        Integer status;
+        String responseHeadersPreview;
+        String responseBodyPreview;
+        int responseBodyChars;
+        String responseContentType;
+        long startedAtMs;
+        long completedAtMs;
+        int score;
+
+        TrafficExchange toTrafficExchange() {
+            return new TrafficExchange(
+                    method,
+                    url,
+                    resourceType,
+                    requestHeadersRaw,
+                    requestHeadersPreview,
+                    requestBodyRaw,
+                    requestBodyPreview,
+                    requestBodyChars,
+                    promptInRequest,
+                    status,
+                    responseHeadersPreview,
+                    responseBodyPreview,
+                    responseBodyChars,
+                    responseContentType,
+                    startedAtMs,
+                    completedAtMs,
+                    score);
+        }
+    }
+
+    public record BrowserMessageResult(String responseText, List<TrafficExchange> trafficExchanges) {}
+
+    public record TrafficExchange(
+            String method,
+            String url,
+            String resourceType,
+            String requestHeadersRaw,
+            String requestHeadersPreview,
+            String requestBodyRaw,
+            String requestBodyPreview,
+            int requestBodyChars,
+            boolean promptInRequest,
+            Integer status,
+            String responseHeadersPreview,
+            String responseBodyPreview,
+            int responseBodyChars,
+            String responseContentType,
+            long startedAtMs,
+            long completedAtMs,
+            int score) {
+
+        public String urlPreview() {
+            if (url == null || url.length() <= 160) {
+                return url;
+            }
+            return url.substring(0, 160) + "...";
+        }
     }
 }

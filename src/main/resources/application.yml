@@ -28,6 +28,10 @@ promptfuzzer:
     core-pool-size: 5
     max-pool-size: 10
     queue-capacity: 100
+  recon:
+    limits:
+      max-capability-verifications: ${RECON_MAX_CAPABILITY_VERIFICATIONS:8}
+      max-attack-units: ${RECON_MAX_ATTACK_UNITS:8}
   oob:
     dnslog:
       enabled: true

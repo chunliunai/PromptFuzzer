@@ -7,11 +7,13 @@ import com.promptfuzzer.agent.workflow.AgentWorkflowState;
 import com.promptfuzzer.service.AgentWorkflowTraceRecorder;
 import com.promptfuzzer.service.BrowserService;
 import com.promptfuzzer.service.HttpRequestService;
+import com.promptfuzzer.service.TargetExecutionRouter;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 @Component
@@ -21,6 +23,7 @@ public class ExecuteTargetNode implements AgentWorkflowNode {
     private final HttpRequestService httpRequestService;
     private final BrowserService browserService;
     private final AgentWorkflowTraceRecorder traceRecorder;
+    private final TargetExecutionRouter targetExecutionRouter;
 
     @Override
     public String name() {
@@ -54,20 +57,39 @@ public class ExecuteTargetNode implements AgentWorkflowNode {
                                      AgentWorkflowState state,
                                      Long browserSessionId,
                                      String message) {
+        return sendBrowserMessageAuto(context, state, browserSessionId, message).getRawResponse();
+    }
+
+    public TargetExecutionRouter.TargetExecutionResult sendBrowserMessageAuto(AgentWorkflowContext context,
+                                                                              AgentWorkflowState state,
+                                                                              Long browserSessionId,
+                                                                              String message) {
         long startedAt = System.currentTimeMillis();
-        Map<String, Object> input = mapOf("mode", "BROWSER_SEND_MESSAGE", "messageChars", length(message));
+        Map<String, Object> input = mapOf("mode", "AUTO_BROWSER_HTTP", "messageChars", length(message));
         try {
-            String rawResponse = browserService.sendMessage(browserSessionId, message);
+            TargetExecutionRouter.TargetExecutionResult result =
+                    targetExecutionRouter.send(context, state, browserSessionId, message);
+            String rawResponse = result != null ? result.getRawResponse() : null;
             if (rawResponse == null) {
                 throw new RuntimeException("Browser returned null response");
             }
+            Map<String, Object> output = mapOf(
+                    "rawResponseChars", rawResponse.length(),
+                    "rawResponsePreview", preview(rawResponse, 500),
+                    "extractedTextPreview", preview(result.getExtractedText(), 300),
+                    "executionChannel", result.getExecutionChannel(),
+                    "statusCode", result.getStatusCode(),
+                    "contentType", result.getContentType(),
+                    "replayProfileId", result.getReplayProfileId(),
+                    "replayProfileClassification", result.getReplayProfileClassification(),
+                    "fallbackType", result.getFallbackType(),
+                    "fallbackReason", result.getFallbackReason(),
+                    "networkCaptureCandidates", summarizeTraffic(result.getTrafficExchanges()));
             traceRecorder.success(context.getTask(), context.getSession(), name(), state.getPhase(),
                     state.getRetryIndex(), state.getTurnIndex(), state.getTargetChatIndex(),
-                    input,
-                    mapOf("rawResponseChars", rawResponse.length(),
-                            "rawResponsePreview", preview(rawResponse, 500)),
+                    input, output,
                     null, null, startedAt);
-            return rawResponse;
+            return result;
         } catch (Exception e) {
             traceRecorder.error(context.getTask(), context.getSession(), name(), state.getPhase(),
                     state.getRetryIndex(), state.getTurnIndex(), state.getTargetChatIndex(),
@@ -141,6 +163,24 @@ public class ExecuteTargetNode implements AgentWorkflowNode {
         return oneLine.length() > maxChars ? oneLine.substring(0, maxChars) + "..." : oneLine;
     }
 
+    private List<Map<String, Object>> summarizeTraffic(List<BrowserService.TrafficExchange> exchanges) {
+        if (exchanges == null || exchanges.isEmpty()) {
+            return List.of();
+        }
+        return exchanges.stream()
+                .map(exchange -> mapOf(
+                        "method", exchange.method(),
+                        "url", exchange.urlPreview(),
+                        "resourceType", exchange.resourceType(),
+                        "status", exchange.status(),
+                        "score", exchange.score(),
+                        "promptInRequest", exchange.promptInRequest(),
+                        "requestBodyChars", exchange.requestBodyChars(),
+                        "responseBodyChars", exchange.responseBodyChars(),
+                        "responseContentType", exchange.responseContentType()))
+                .toList();
+    }
+
     private Map<String, Object> mapOf(Object... entries) {
         Map<String, Object> map = new LinkedHashMap<>();
         for (int i = 0; i + 1 < entries.length; i += 2) {
@@ -155,4 +195,5 @@ public class ExecuteTargetNode implements AgentWorkflowNode {
         private int targetChatIndex;
         private String evidence;
     }
+
 }

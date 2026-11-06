@@ -17,6 +17,7 @@ public class ReconTraceResponse {
     private String rawResponse;
     private String extractedText;
     private String observation;
+    private String executionChannel;
     private String evidenceType;
     private String status;
     private String errorMessage;
@@ -34,6 +35,8 @@ public class ReconTraceResponse {
         response.setRawResponse(trace.getRawResponse());
         response.setExtractedText(trace.getExtractedText());
         response.setObservation(trace.getObservation());
+        response.setExecutionChannel(trace.getExecutionChannel() != null
+                ? trace.getExecutionChannel().name() : null);
         response.setEvidenceType(trace.getEvidenceType() != null
                 ? trace.getEvidenceType().name() : null);
         response.setStatus(trace.getStatus().name());

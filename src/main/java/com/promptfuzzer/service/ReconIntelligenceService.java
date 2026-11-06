@@ -107,15 +107,31 @@ public class ReconIntelligenceService {
             item.put("description", surface.getCurrentDescription());
             item.put("surfaceType", surface.getSurfaceType());
             item.put("relatedTool", surface.getRelatedTool());
-            item.put("supportedActions", surface.getSupportedActions());
+            item.set("supportedActions", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readStringArray(
+                            surface.getSupportedActions())));
             item.put("resourceScope", surface.getResourceScope());
+            item.set("resourceObjects", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readStringArray(
+                            surface.getResourceObjects())));
+            item.set("entrypoints", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readStringArray(
+                            surface.getEntrypoints())));
+            item.set("permissionBoundaries", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readStringArray(
+                            surface.getPermissionBoundaries())));
+            item.set("controlBoundaries", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readStringArray(
+                            surface.getControlBoundaries())));
             if (surface.getEvidenceSource() != null) {
                 item.put("evidenceSource", surface.getEvidenceSource().name());
             }
             if (surface.getVerificationStatus() != null) {
                 item.put("verificationStatus", surface.getVerificationStatus().name());
             }
-            item.put("sourceTraceIds", surface.getSourceTraceIds());
+            item.set("sourceTraceIds", objectMapper.valueToTree(
+                    ReconSurfaceDataCodec.readLongArray(
+                            surface.getSourceTraceIds())));
             if (surface.getSourceType() != null) {
                 item.put("sourceType", surface.getSourceType().name());
             }

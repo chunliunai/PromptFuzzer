@@ -35,7 +35,7 @@ public class AgentWorkflowEngine {
 
     public void executeSession(Long sessionId, Long existingBrowserSessionId) {
         long startedAt = System.currentTimeMillis();
-        AgentSession session = agentSessionRepository.findById(sessionId).orElse(null);
+        AgentSession session = findSessionWithRetry(sessionId);
         Task task = session != null ? taskRepository.findById(session.getTaskId()).orElse(null) : null;
         Map<String, Object> input = mapOf(
                 "sessionId", sessionId,
@@ -43,6 +43,9 @@ public class AgentWorkflowEngine {
                 "nodes", nodeNames()
         );
         try {
+            if (session == null) {
+                throw new IllegalStateException("AgentSession not found after retry: " + sessionId);
+            }
             log.info("Agent workflow engine taking over session {} with nodes={}", sessionId, nodeNames());
             sessionRunner.runSession(sessionId, existingBrowserSessionId);
             AgentSession refreshed = agentSessionRepository.findById(sessionId).orElse(session);
@@ -64,6 +67,22 @@ public class AgentWorkflowEngine {
                     input, null, null, "Workflow Engine 执行异常", e, startedAt);
             throw e;
         }
+    }
+
+    private AgentSession findSessionWithRetry(Long sessionId) {
+        for (int attempt = 0; attempt < 5; attempt++) {
+            AgentSession session = agentSessionRepository.findById(sessionId).orElse(null);
+            if (session != null) {
+                return session;
+            }
+            try {
+                Thread.sleep(100L * (attempt + 1));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
     }
 
     private Map<String, Object> mapOf(Object... entries) {
