@@ -22,4 +22,7 @@ public class McpInspectorProperties {
 
     /** 等待 Inspector Web UI 启动的超时秒数。 */
     private int startTimeoutSeconds = 20;
+
+    /** CLI 一次性验证的等待秒数（OAuth 回调不会完成，到时强杀属预期）。 */
+    private int runTimeoutSeconds = 45;
 }

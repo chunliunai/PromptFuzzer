@@ -1,5 +1,6 @@
 package com.promptfuzzer.controller;
 
+import com.promptfuzzer.dto.McpInspectorRunResponse;
 import com.promptfuzzer.dto.McpInspectorSessionResponse;
 import com.promptfuzzer.dto.McpInspectorStartRequest;
 import com.promptfuzzer.service.McpInspectorService;
@@ -35,5 +36,11 @@ public class McpInspectorController {
     @PostMapping("/stop")
     public ResponseEntity<McpInspectorSessionResponse> stop() {
         return ResponseEntity.ok(inspectorService.stop());
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<McpInspectorRunResponse> run(
+            @RequestBody McpInspectorStartRequest request) {
+        return ResponseEntity.ok(inspectorService.runOnce(request));
     }
 }

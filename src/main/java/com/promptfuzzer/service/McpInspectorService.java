@@ -1,6 +1,7 @@
 package com.promptfuzzer.service;
 
 import com.promptfuzzer.config.McpInspectorProperties;
+import com.promptfuzzer.dto.McpInspectorRunResponse;
 import com.promptfuzzer.dto.McpInspectorSessionResponse;
 import com.promptfuzzer.dto.McpInspectorStartRequest;
 import jakarta.annotation.PreDestroy;
@@ -40,9 +41,12 @@ public class McpInspectorService {
 
     private static final String LAUNCHER_RELATIVE =
             "node_modules/@modelcontextprotocol/inspector/clients/launcher/build/index.js";
+    private static final String CLI_RELATIVE =
+            "node_modules/@modelcontextprotocol/inspector/clients/cli/build/index.js";
     private static final Pattern TOKEN_PATTERN =
             Pattern.compile("MCP_INSPECTOR_API_TOKEN=([0-9a-fA-F]+)");
     private static final int MAX_LOG_LINES = 300;
+    private static final int MAX_RUN_OUTPUT_CHARS = 20_000;
 
     private static final Map<String, VariantSpec> VARIANTS = Map.of(
             "vulnerable", new VariantSpec("inspector-vulnerable", "2.11.0"),
@@ -54,25 +58,109 @@ public class McpInspectorService {
 
     private Session current;
 
+    /**
+     * CLI 一次性验证：在本机直接运行钉版本 Inspector（{@code --cli --method initialize}），
+     * 自动完成 initialize → 401 → OAuth 发现 → open() 全链路，无需打开 Inspector Web UI。
+     *
+     * <p>恶意 Server 不会完成 OAuth 回调，因此 CLI 会一直等待，超时强杀属于预期；
+     * 漏洞触发点（open 调用）发生在等待期间。
+     */
+    public McpInspectorRunResponse runOnce(McpInspectorStartRequest request) {
+        ValidatedRequest validated = validate(request);
+        Path cli = resolveVariantFile(validated.spec(), CLI_RELATIVE);
+
+        // 直接调用 CLI 入口（clients/cli/build/index.js），无需 launcher 的 --cli 分发参数。
+        List<String> command = new ArrayList<>(List.of(
+                properties.getNodeCommand(),
+                cli.toAbsolutePath().toString(),
+                "--transport", validated.transport(),
+                "--server-url", validated.serverUrl(),
+                "--method", "initialize"
+        ));
+        String launchCommand = String.join(" ", command);
+
+        long startedAt = System.currentTimeMillis();
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        // PT 子进程没有 TTY，不显式放行的话 Inspector CLI 会拒绝自动打开（auth_required）。
+        pb.environment().put("MCP_AUTO_OPEN_ENABLED", "true");
+
+        Process process;
+        try {
+            process = pb.start();
+        } catch (Exception e) {
+            throw new IllegalStateException("启动 MCP Inspector CLI 失败：" + e.getMessage()
+                    + "（请确认 node 已安装且在 PATH 中）", e);
+        }
+
+        StringBuilder output = new StringBuilder();
+        Thread reader = new Thread(() -> {
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    synchronized (output) {
+                        if (output.length() < MAX_RUN_OUTPUT_CHARS) {
+                            output.append(line).append('\n');
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // 进程结束时读取流可能抛异常，忽略即可
+            }
+        }, "mcp-inspector-cli-log");
+        reader.setDaemon(true);
+        reader.start();
+
+        boolean timedOut = false;
+        try {
+            boolean finished = process.waitFor(properties.getRunTimeoutSeconds(), TimeUnit.SECONDS);
+            if (!finished) {
+                timedOut = true;
+                process.destroy();
+                if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                }
+                reader.join(2000);
+            } else {
+                reader.join(3000);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
+
+        Integer exitCode = process.isAlive() ? null : safeExitCode(process);
+        String captured;
+        synchronized (output) {
+            captured = output.length() > MAX_RUN_OUTPUT_CHARS
+                    ? output.substring(0, MAX_RUN_OUTPUT_CHARS) + "\n...（输出已截断）"
+                    : output.toString();
+        }
+
+        return McpInspectorRunResponse.builder()
+                .variant(validated.spec().dir.equals("inspector-vulnerable") ? "vulnerable" : "fixed")
+                .version(validated.spec().version)
+                .transport(validated.transport())
+                .serverUrl(validated.serverUrl())
+                .command(launchCommand)
+                .exitCode(exitCode)
+                .timedOut(timedOut)
+                .durationMs(System.currentTimeMillis() - startedAt)
+                .output(captured)
+                .build();
+    }
+
     public synchronized McpInspectorSessionResponse start(McpInspectorStartRequest request) {
-        VariantSpec spec = VARIANTS.get(Optional.ofNullable(request.getVariant())
-                .orElse("vulnerable").trim().toLowerCase());
-        if (spec == null) {
-            throw new IllegalArgumentException("variant 必须是 vulnerable 或 fixed");
-        }
-        String transport = Optional.ofNullable(request.getTransport()).orElse("http").trim().toLowerCase();
-        if (!SUPPORTED_TRANSPORTS.contains(transport)) {
-            throw new IllegalArgumentException("transport 仅支持 http / sse");
-        }
-        String serverUrl = request.getServerUrl() == null ? "" : request.getServerUrl().trim();
-        if (serverUrl.isEmpty()) {
-            throw new IllegalArgumentException("serverUrl 不能为空");
-        }
+        ValidatedRequest validated = validate(request);
+        VariantSpec spec = validated.spec();
+        String transport = validated.transport();
+        String serverUrl = validated.serverUrl();
 
         // 复用同一进程前先停止旧会话
         stopInternal();
 
-        Path launcher = resolveLauncher(spec);
+        Path launcher = resolveVariantFile(spec, LAUNCHER_RELATIVE);
         int port = findFreePort();
 
         List<String> command = new ArrayList<>(List.of(
@@ -180,17 +268,34 @@ public class McpInspectorService {
         this.current = null;
     }
 
-    private Path resolveLauncher(VariantSpec spec) {
+    private ValidatedRequest validate(McpInspectorStartRequest request) {
+        VariantSpec spec = VARIANTS.get(Optional.ofNullable(request.getVariant())
+                .orElse("vulnerable").trim().toLowerCase());
+        if (spec == null) {
+            throw new IllegalArgumentException("variant 必须是 vulnerable 或 fixed");
+        }
+        String transport = Optional.ofNullable(request.getTransport()).orElse("http").trim().toLowerCase();
+        if (!SUPPORTED_TRANSPORTS.contains(transport)) {
+            throw new IllegalArgumentException("transport 仅支持 http / sse");
+        }
+        String serverUrl = request.getServerUrl() == null ? "" : request.getServerUrl().trim();
+        if (serverUrl.isEmpty()) {
+            throw new IllegalArgumentException("serverUrl 不能为空");
+        }
+        return new ValidatedRequest(spec, transport, serverUrl);
+    }
+
+    private Path resolveVariantFile(VariantSpec spec, String relative) {
         Path root = Paths.get(properties.getLabsRoot());
         if (!root.isAbsolute()) {
             root = Paths.get(System.getProperty("user.dir")).resolve(root);
         }
-        Path launcher = root.resolve(spec.dir).resolve(LAUNCHER_RELATIVE).normalize();
-        if (!Files.isRegularFile(launcher)) {
+        Path target = root.resolve(spec.dir).resolve(relative).normalize();
+        if (!Files.isRegularFile(target)) {
             throw new IllegalStateException(
-                    "未找到钉版本 Inspector：" + launcher + "，请先在该目录执行 npm install。");
+                    "未找到钉版本 Inspector：" + target + "，请先在该目录执行 npm install。");
         }
-        return launcher;
+        return target;
     }
 
     private int findFreePort() {
@@ -210,6 +315,9 @@ public class McpInspectorService {
     }
 
     private record VariantSpec(String dir, String version) {
+    }
+
+    private record ValidatedRequest(VariantSpec spec, String transport, String serverUrl) {
     }
 
     /** 单次 Inspector 会话及其输出采集。 */
