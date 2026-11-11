@@ -367,7 +367,18 @@ PromptFuzzer/
 - Workflow Trace、Judge、Composite Review 和任务删除。
 - Vue 3 管理端的主要操作流程。
 
-后续重点包括报告增强、更多 Goal、候选质量优化和跨任务经验复用。
+2026-11-09 状态同步：
+
+- 后端全量测试 `142 passed`。
+- 2026-10-19 曾使用 PT 原生 Profile smoke 链路完成 ReconBench 11/11
+  对话验证；这是该日期的历史验收证据。
+- 当前 `127.0.0.1:9091` 实例只加载 5 个历史 Profile，0 个 `VERIFIED`，
+  尚未恢复到 Full-11 运行前状态。
+- ReconBench T1-T6 基础设施已验收；T7-T10 Run 级 smoke、formal Lock、
+  primary-10/all-11 正式运行和人工审计仍待完成。
+
+后续重点是先恢复 ReconBench 运行绑定和完整性门禁，再完成正式闭环；产品侧继续推进
+报告增强、候选质量优化和跨任务经验复用。
 
 ## 安全与责任边界
 
